@@ -16,6 +16,8 @@ RUN sudo apt update && \
     sudo apt clean && \
     sudo rm -rf /var/lib/apt/lists/* && \
     pip3 install pwntools pymongo --break-system-packages && \
+    pip3 install 'playwright>=1.51,<2' --break-system-packages && \
+    python3 -m playwright install chromium && \
     sudo npm install -g @playwright/cli@latest && \
     cd /tmp && playwright-cli install
 

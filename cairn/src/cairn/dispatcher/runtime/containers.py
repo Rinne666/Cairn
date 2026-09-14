@@ -10,7 +10,7 @@ import docker
 from docker.errors import APIError, DockerException, NotFound
 from docker.models.containers import Container
 
-from cairn.dispatcher.config import ContainerConfig
+from cairn.dispatcher.config import AuthConfig, ContainerConfig
 from cairn.dispatcher.runtime.process import ManagedProcess
 
 LOG = logging.getLogger(__name__)
@@ -19,14 +19,44 @@ LOG = logging.getLogger(__name__)
 class ContainerManager:
     _PREFIX = "cairn-dispatch-"
 
-    def __init__(self, config: ContainerConfig):
+    def __init__(self, config: ContainerConfig, auth_config: AuthConfig | None = None):
         self._config = config
+        self._auth_config = auth_config
         self._client = docker.from_env()
         self._ensure_running_locks: dict[str, threading.Lock] = {}
         self._ensure_running_locks_guard = threading.Lock()
 
     def close(self) -> None:
         self._client.close()
+
+    def project_env(self, project_id: str) -> dict[str, str]:
+        """Environment variables injected into every worker process.
+
+        ``CAIRN_AUTH_DIR`` points at the read-only mount inside the container; the
+        worker never needs to know whether the underlying store is Docker bind-mounted
+        or a host directory.
+        """
+        env = {"CAIRN_PROJECT_ID": project_id}
+        if self._auth_config is not None:
+            env["CAIRN_AUTH_DIR"] = self._auth_config.worker_mount_root
+        return env
+
+    def _auth_volumes(self, project_id: str) -> dict[str, dict[str, str]]:
+        """Build the read-only bind mount for the project's auth state.
+
+        The host path is ``<store_root>/<project_id>`` (the Docker host path, since the
+        dispatcher talks to the host daemon over ``/var/run/docker.sock``) and it is
+        mounted read-only at ``worker_mount_root`` (``/run/cairn-auth``).
+        """
+        if self._auth_config is None:
+            return {}
+        host_dir = f"{self._auth_config.store_root.rstrip('/')}/{project_id}"
+        return {
+            host_dir: {
+                "bind": self._auth_config.worker_mount_root,
+                "mode": "ro",
+            }
+        }
 
     def container_name(self, project_id: str) -> str:
         sanitized = project_id.replace("/", "-")
@@ -47,6 +77,7 @@ class ContainerManager:
             self._start_existing(name)
             return name
         LOG.info("creating container project=%s container=%s image=%s", project_id, name, self._config.image)
+        volumes = self._auth_volumes(project_id)
         try:
             self._client.containers.run(
                 self._config.image,
@@ -55,6 +86,7 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
+                volumes=volumes or None,
             )
             LOG.info("created container project=%s container=%s", project_id, name)
             return name

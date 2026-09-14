@@ -12,7 +12,9 @@ _db_path: Path | None = None
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS settings (
     intent_timeout INTEGER NOT NULL DEFAULT 15,
-    reason_timeout INTEGER NOT NULL DEFAULT 15
+    reason_timeout INTEGER NOT NULL DEFAULT 15,
+    auth_claim_ttl INTEGER NOT NULL DEFAULT 300,
+    auth_request_ttl INTEGER NOT NULL DEFAULT 1800
 );
 
 INSERT OR IGNORE INTO settings (rowid, intent_timeout, reason_timeout) VALUES (1, 15, 15);
@@ -79,6 +81,24 @@ CREATE TABLE IF NOT EXISTS scoped_counters (
     value INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, kind)
 );
+
+CREATE TABLE IF NOT EXISTS auth_requests (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_fact_ids TEXT NOT NULL,
+    auth_ref TEXT NOT NULL,
+    role TEXT NOT NULL,
+    login_url TEXT,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    claimed_by TEXT,
+    created_at TEXT NOT NULL,
+    claimed_at TEXT,
+    completed_at TEXT,
+    failure_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_requests_project ON auth_requests (project_id, auth_ref);
 """
 
 
@@ -91,6 +111,7 @@ def configure(path: Path) -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         _ensure_project_columns(conn)
+        _ensure_settings_columns(conn)
 
 
 def _ensure_project_columns(conn: sqlite3.Connection) -> None:
@@ -101,6 +122,18 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE projects SET bootstrap_enabled = CASE WHEN bootstrap_mode = 'disabled' THEN 0 ELSE 1 END"
             )
+
+
+def _ensure_settings_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(settings)")}
+    if "auth_claim_ttl" not in columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN auth_claim_ttl INTEGER NOT NULL DEFAULT 300"
+        )
+    if "auth_request_ttl" not in columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN auth_request_ttl INTEGER NOT NULL DEFAULT 1800"
+        )
 
 
 @contextmanager

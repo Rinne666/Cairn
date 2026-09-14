@@ -22,6 +22,11 @@ If Goal has not been satisfied but new intents should be proposed, return:
 {"accepted": true, "data": {"intents": [{"from": ["f001"], "description": "..."}, {"from": ["f002", "f003"], "description": "..."}]}}
 ```
 
+If authentication is required before a scan can continue, return an auth intervention (optionally alongside normal intents for anonymous work):
+```json
+{"accepted": true, "data": {"intents": [{"from": ["f005"], "description": "continue enumerating public API"}], "interventions": [{"type": "auth", "from": ["f008"], "target": "target-user", "role": "user", "reason": "orders and accounts require user authentication"}]}}
+```
+
 If Goal has not been satisfied and no new intent should currently be proposed, return:
 ```json
 {"accepted": true, "data": {}}
@@ -37,6 +42,19 @@ If Goal has not been satisfied and no new intent should currently be proposed, r
 - Each Intent should be a high-value exploration direction. It does not need to be overly detailed. Focus on the core insight and a clear direction. Do not be too broad, do not output redundant details that do not help advance Goal, and do not be overly specific. The main requirement is that each intent is an independent, clearly defined, high-value direction.
 - An Intent may originate from multiple facts.
 - Different intents should cover different exploration dimensions and avoid duplication or heavy overlap.
+
+## Authentication Rules
+- Authentication is a prerequisite state. You must NOT propose an authenticated scan Intent unless an `AuthSessionVerified` fact already exists for the target you intend to explore.
+- If the Goal requires authenticated exploration and no `AuthSessionVerified` fact is present, propose an Intent to acquire / verify authentication first.
+- If an `AuthSessionInvalid` fact is newer than the corresponding `AuthSessionVerified` fact, the session is stale; propose re-acquiring / re-verifying authentication instead of continuing authenticated exploration.
+- Never include or request secrets (passwords, cookies, JWTs, tokens, MFA secrets) in any Intent description.
+
+## Human Intervention Rules
+- When continuing exploration requires authentication and no valid `AuthSessionVerified` fact exists in the graph, do NOT create a normal Intent that asks the agent to log in by itself. Human login is not an agent task.
+- Instead, emit an `interventions` array with an `auth` intervention. The intervention does not enter the normal Explore queue; it is routed to a human operator.
+- Only create an auth intervention when authentication is an actual prerequisite for the scan (not merely optional).
+- An auth intervention has this shape: `{"type": "auth", "from": ["<fact_id>"], "target": "<auth_ref>", "role": "<role>", "reason": "<why auth is required>"}`.
+- Never put passwords, cookies, tokens, Authorization headers or MFA secrets into the intervention.
 
 ## Context
 ### Graph

@@ -21,6 +21,11 @@ Normal return example:
 - `description` must clearly state the confirmed key objective results. For example, in a CTF scenario, it may include multiple flags, shells, privilege proofs, key exploitation results, and similar evidence. Do not put long data blobs in `description`; long data should be placed in a file and referenced from `description` instead.
 - `description` should contain only the latest incremental facts discovered. Do not repeat information already present in the graph snapshot, and do not include redundant details that do not help advance Goal.
 
+## Authentication Rules
+- When an authenticated Intent requires a session, locate the matching `AuthSessionVerified` fact to obtain its `auth_ref`.
+- Read the session storage state from `$CAIRN_AUTH_DIR/<auth_ref>/state.json` and use it to drive authenticated requests / browser sessions.
+- Never `cat` or print the contents of `state.json`, and never emit cookies, `Authorization` headers, bearer tokens, JWTs or any other secret into your final JSON output.
+
 # Context
 ## Graph
 ```

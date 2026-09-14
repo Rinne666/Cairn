@@ -183,6 +183,16 @@ def get_reason_timeout(conn: sqlite3.Connection) -> int:
     return row["reason_timeout"]
 
 
+def get_auth_claim_ttl(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT auth_claim_ttl FROM settings WHERE rowid = 1").fetchone()
+    return row["auth_claim_ttl"]
+
+
+def get_auth_request_ttl(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT auth_request_ttl FROM settings WHERE rowid = 1").fetchone()
+    return row["auth_request_ttl"]
+
+
 def project_reason_from_row(row: sqlite3.Row) -> ProjectReason | None:
     if row["reason_worker"] is None:
         return None
@@ -255,3 +265,202 @@ def expire_reason_leases(conn: sqlite3.Connection, project_id: str | None = None
         query = query.replace("WHERE ", "WHERE id = ? AND ", 1)
         params = (project_id, now, timeout)
     conn.execute(query, params)
+
+
+def next_auth_request_id(conn: sqlite3.Connection) -> str:
+    """Return the next global auth request id (``auth_001`` ...)."""
+    conn.execute(
+        "INSERT OR IGNORE INTO counters (name, value) VALUES ('auth_request', 0)"
+    )
+    conn.execute(
+        "UPDATE counters SET value = value + 1 WHERE name = 'auth_request'"
+    )
+    row = conn.execute(
+        "SELECT value FROM counters WHERE name = 'auth_request'"
+    ).fetchone()
+    assert row is not None
+    return f"auth_{row['value']:03d}"
+
+
+def find_active_auth_request(
+    conn: sqlite3.Connection, project_id: str, auth_ref: str
+) -> sqlite3.Row | None:
+    """Return an in-flight auth request for the logical key, if any.
+
+    The logical dedup key is ``(project_id, auth_ref, active-status)`` so Reason never
+    creates a duplicate request while one is still being handled.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM auth_requests
+        WHERE project_id = ?
+          AND auth_ref = ?
+          AND status IN ('pending', 'claimed', 'waiting_user', 'verifying')
+        """,
+        (project_id, auth_ref),
+    ).fetchone()
+
+
+def get_auth_request_or_404(
+    conn: sqlite3.Connection, request_id: str
+) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM auth_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "Auth request not found")
+    return row
+
+
+def auth_request_to_model(row: sqlite3.Row) -> "AuthRequest":
+    from cairn.server.models import AuthRequest
+
+    return AuthRequest(
+        id=row["id"],
+        project_id=row["project_id"],
+        source_fact_ids=_split_source_fact_ids(row["source_fact_ids"]),
+        auth_ref=row["auth_ref"],
+        role=row["role"],
+        login_url=row["login_url"],
+        reason=row["reason"],
+        status=row["status"],
+        claimed_by=row["claimed_by"],
+        created_at=row["created_at"],
+        claimed_at=row["claimed_at"],
+        completed_at=row["completed_at"],
+        failure_reason=row["failure_reason"],
+    )
+
+
+def _split_source_fact_ids(raw: str) -> list[str]:
+    if not raw:
+        return []
+    return [part for part in raw.split("\n") if part]
+
+
+def _join_source_fact_ids(fact_ids: list[str]) -> str:
+    return "\n".join(fact_ids)
+
+
+def claim_auth_request_atomic(
+    conn: sqlite3.Connection, request_id: str, helper_id: str
+) -> bool:
+    """Atomically claim a ``pending`` auth request.
+
+    Returns ``True`` only if exactly one row was transitioned. A ``0`` rowcount means
+    another helper already claimed it (or it is no longer pending), so the caller must
+    back off to avoid duplicate popups across multiple helpers / dispatchers.
+    """
+    now = utcnow()
+    cursor = conn.execute(
+        """
+        UPDATE auth_requests
+        SET status = 'claimed',
+            claimed_by = ?,
+            claimed_at = ?
+        WHERE id = ?
+          AND status = 'pending'
+        """,
+        (helper_id, now, request_id),
+    )
+    return cursor.rowcount == 1
+
+
+class AuthStateResolver:
+    """Resolve the current authentication state for ``(project_id, auth_ref)``.
+
+    Authentication state is a *temporal* fact: a later ``AuthSessionInvalid`` fact
+    overrides an earlier ``AuthSessionVerified`` fact, and vice-versa. This resolver
+    inspects the fact descriptions in insertion order and returns the latest state.
+    """
+
+    VERIFIED_MARKER = "AuthSessionVerified"
+    INVALID_MARKER = "AuthSessionInvalid"
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def resolve(self, project_id: str, auth_ref: str) -> str:
+        rows = self._conn.execute(
+            "SELECT description FROM facts WHERE project_id = ? ORDER BY rowid",
+            (project_id,),
+        ).fetchall()
+        state = "missing"
+        for row in rows:
+            description = row["description"] or ""
+            if auth_ref not in description:
+                continue
+            if self.VERIFIED_MARKER in description:
+                state = "valid"
+            elif self.INVALID_MARKER in description:
+                state = "invalid"
+        return state
+
+
+def build_auth_state_resolver(conn: sqlite3.Connection) -> AuthStateResolver:
+    return AuthStateResolver(conn)
+
+
+def _parse_ts(value: str | None) -> datetime:
+    """Parse a stored ``YYYY-MM-DDTHH:MM:SSZ`` timestamp to a tz-aware datetime."""
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _age_seconds(value: str | None, now: datetime) -> float:
+    return (now - _parse_ts(value)).total_seconds()
+
+
+def expire_stale_claims(conn: sqlite3.Connection, claim_ttl: int) -> int:
+    """Return ``claimed`` auth requests stuck past ``claim_ttl`` seconds to ``pending``.
+
+    A helper claims a request, then immediately opens the browser and transitions it to
+    ``waiting_user``. If the helper crashes (or the operator never acts) before that
+    transition, the request must not stay ``claimed`` forever, otherwise the dedup guard
+    in :func:`find_active_auth_request` would block re-claiming forever. This releases
+    the stale claim so another helper can pick it up.
+
+    Returns the number of rows released.
+    """
+    if claim_ttl <= 0:
+        return 0
+    now = datetime.now(timezone.utc)
+    cutoff = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    cursor = conn.execute(
+        """
+        UPDATE auth_requests
+        SET status = 'pending',
+            claimed_by = NULL,
+            claimed_at = NULL
+        WHERE status = 'claimed'
+          AND claimed_at IS NOT NULL
+          AND (julianday(?) - julianday(claimed_at)) * 86400 > ?
+        """,
+        (cutoff, claim_ttl),
+    )
+    return cursor.rowcount
+
+
+def expire_stale_requests(conn: sqlite3.Connection, request_ttl: int) -> int:
+    """Mark active auth requests older than ``request_ttl`` seconds as ``expired``.
+
+    Applies to ``pending`` / ``claimed`` / ``waiting_user`` / ``verifying``. Expired
+    requests no longer participate in dedup (they are not in the active status set), so
+    a later Reason run may create a fresh request.
+    """
+    if request_ttl <= 0:
+        return 0
+    now = datetime.now(timezone.utc)
+    cutoff = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    cursor = conn.execute(
+        """
+        UPDATE auth_requests
+        SET status = 'expired',
+            completed_at = ?
+        WHERE status IN ('pending', 'claimed', 'waiting_user', 'verifying')
+          AND (julianday(?) - julianday(created_at)) * 86400 > ?
+        """,
+        (cutoff, cutoff, request_ttl),
+    )
+    return cursor.rowcount

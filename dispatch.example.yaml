@@ -1,6 +1,51 @@
 # Cairn server API endpoint.
 server: "http://cairn-server:8000"
 
+# Real-environment login authentication. Credentials live in the execution environment
+# (the auth store), while only AuthSessionVerified / AuthSessionInvalid facts enter the
+# graph. Secrets must never be written into facts, intents, hints or agent prompts.
+#
+# auth:
+#   store_root: "/opt/cairn/auth"     # host path, read-write for the dispatcher
+#   worker_mount_root: "/run/cairn-auth"  # read-only mount inside the worker container
+#   login_timeout: 900                 # seconds to wait for the operator to log in
+#   verify_timeout: 30                 # seconds per verification layer
+#   intervention:
+#     enabled: true                    # route auth requests to a human operator
+#     request_ttl: 1800                # seconds before an active request is marked expired
+#     claim_ttl: 300                   # seconds a helper may hold a claim before it is released
+#     allow_roles:                     # roles the agent may request auth for (empty = allow all)
+#       - user
+#       - admin
+#   targets:
+#     - name: "target-user"            # logical auth_ref the agent sees
+#       base_url: "https://target.example.com"
+#       login_url: "https://target.example.com/login"
+#       role: "user"
+#       indexed_db: true
+#       verify:
+#         url: "https://target.example.com/dashboard"
+#         expect_status: 200
+#         selector: "[data-testid='user-menu']"
+#         http_url: "https://target.example.com/api/me"
+#         http_expect_status: 200
+#     - name: "target-admin"
+#       base_url: "https://target.example.com"
+#       login_url: "https://target.example.com/login"
+#       role: "admin"
+#       verify:
+#         url: "https://target.example.com/admin"
+#         selector: "#admin-panel"
+#
+# Desktop auth helper (runs on the operator's real desktop, not in Docker):
+#
+#   cairn auth-helper \
+#     --server http://localhost:8000 \
+#     --config dispatch.yaml \
+#     --helper-name my-desktop \
+#     --auto-launch \
+#     --max-parallel 1
+
 # Shared environment variables merged into every worker.
 common_env:
   TSEC_SERVER_HOST: "<SERVER_HOST>:8000"

@@ -78,6 +78,7 @@ def run_worker_process(
     *,
     phase: str,
     timeout_seconds: int,
+    project_id: str,
     lease: HeartbeatLease | None = None,
     cancellation: TaskCancellation | None = None,
 ) -> ProcessResult:
@@ -90,7 +91,10 @@ def run_worker_process(
     )
     process = container_manager.build_exec_process(
         container_name,
-        dict(worker.env),
+        {
+            **worker.env,
+            **container_manager.project_env(project_id),
+        },
         argv,
         timeout_seconds=timeout_seconds,
     )

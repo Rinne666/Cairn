@@ -150,6 +150,57 @@ class TasksConfig(BaseModel):
     explore: ExploreTaskConfig
 
 
+class AuthVerifyConfig(BaseModel):
+    url: str
+    expect_status: int = 200
+
+    selector: str | None = None
+
+    http_url: str | None = None
+    http_expect_status: int = 200
+
+
+class AuthTargetConfig(BaseModel):
+    name: str
+
+    base_url: str
+    login_url: str
+
+    role: str
+
+    indexed_db: bool = True
+
+    verify: AuthVerifyConfig
+
+
+class AuthInterventionConfig(BaseModel):
+    enabled: bool = True
+    request_ttl: int = Field(default=1800, gt=0)
+    claim_ttl: int = Field(default=300, gt=0)
+    allow_roles: list[str] = Field(default_factory=list)
+
+
+class AuthConfig(BaseModel):
+    store_root: str
+
+    worker_mount_root: str = "/run/cairn-auth"
+
+    login_timeout: int = Field(default=600, gt=0)
+
+    verify_timeout: int = Field(default=30, gt=0)
+
+    targets: list[AuthTargetConfig] = Field(default_factory=list)
+
+    intervention: AuthInterventionConfig = Field(default_factory=AuthInterventionConfig)
+
+    def target(self, name: str) -> AuthTargetConfig:
+        """Return the auth target by logical name (the ``auth_ref``)."""
+        for candidate in self.targets:
+            if candidate.name == name:
+                return candidate
+        raise KeyError(f"auth target not found: {name}")
+
+
 class ContainerConfig(BaseModel):
     image: str
     network_mode: str
@@ -213,6 +264,7 @@ class DispatchConfig(BaseModel):
     container: ContainerConfig | None = None
     local: LocalConfig | None = None
     common_env: dict[str, str] = Field(default_factory=dict)
+    auth: AuthConfig | None = None
     workers: list[WorkerConfig]
 
     @model_validator(mode="before")
@@ -254,6 +306,15 @@ class DispatchConfig(BaseModel):
             raise ValueError("workers must not be empty")
         if self.runtime.max_project_workers > self.runtime.max_workers:
             raise ValueError("max_project_workers cannot exceed max_workers")
+        return self
+
+    @model_validator(mode="after")
+    def validate_auth_targets(self) -> "DispatchConfig":
+        if self.auth is None:
+            return self
+        names = [target.name for target in self.auth.targets]
+        if len(set(names)) != len(names):
+            raise ValueError("auth target names must be unique")
         return self
 
     @model_validator(mode="after")

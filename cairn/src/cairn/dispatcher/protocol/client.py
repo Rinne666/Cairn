@@ -121,11 +121,61 @@ class CairnClient:
             json={"from": from_ids, "description": description, "worker": worker},
         )
 
-    def create_intent(self, project_id: str, from_ids: list[str], description: str, creator: str) -> ApiResult:
+    def create_intent(self, project_id: str, from_ids: list[str], description: str, creator: str, worker: str | None = None) -> ApiResult:
         return self._request_json(
             "POST",
             f"/projects/{project_id}/intents",
-            json={"from": from_ids, "description": description, "creator": creator, "worker": None},
+            json={"from": from_ids, "description": description, "creator": creator, "worker": worker},
+        )
+
+    def create_auth_request(
+        self,
+        project_id: str,
+        source_fact_ids: list[str],
+        auth_ref: str,
+        role: str,
+        reason: str,
+        login_url: str | None = None,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/auth-requests",
+            json={
+                "source_fact_ids": source_fact_ids,
+                "auth_ref": auth_ref,
+                "role": role,
+                "reason": reason,
+                "login_url": login_url,
+            },
+        )
+
+    def list_auth_requests(self, status: str | None = None) -> ApiResult:
+        path = "/auth-requests"
+        if status is not None:
+            path = f"{path}?status={status}"
+        return self._request_json("GET", path, json={})
+
+    def claim_auth_request(self, request_id: str, helper_id: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/auth-requests/{request_id}/claim",
+            json={"helper_id": helper_id},
+        )
+
+    def auth_request_waiting(self, request_id: str) -> ApiResult:
+        return self._request_json("POST", f"/auth-requests/{request_id}/waiting", json={})
+
+    def auth_request_verifying(self, request_id: str) -> ApiResult:
+        return self._request_json("POST", f"/auth-requests/{request_id}/verifying", json={})
+
+    def auth_request_complete(self, request_id: str) -> ApiResult:
+        return self._request_json("POST", f"/auth-requests/{request_id}/complete", json={})
+
+    def auth_request_fail(self, request_id: str, failure_reason: str | None = None) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/auth-requests/{request_id}/fail",
+            json={"failure_reason": failure_reason},
         )
 
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:

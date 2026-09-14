@@ -46,10 +46,10 @@ class DispatcherLoop:
         self.config = DispatchConfig.load(config_path)
         self.client = CairnClient(self.config.server)
         if self.config.runtime.execution == "local":
-            self.container_manager = LocalBackend(self.config.local or LocalConfig())
+            self.container_manager = LocalBackend(self.config.local or LocalConfig(), self.config.auth)
         else:
             assert self.config.container is not None
-            self.container_manager = ContainerManager(self.config.container)
+            self.container_manager = ContainerManager(self.config.container, self.config.auth)
         self.executor = ThreadPoolExecutor(max_workers=self.config.runtime.max_workers)
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
         self.futures: dict[Future[str], RunningTask] = {}

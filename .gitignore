@@ -4,3 +4,13 @@ __pycache__/
 .playwright-cli/
 datas/
 dispatch.yaml
+# Runtime credential artifacts (auth store). NOTE: must be anchored — a bare
+# `auth/` pattern would also swallow the source package cairn/src/cairn/auth/.
+/.auth/
+/auth/
+*.storage-state.json
+*.storage.json
+
+# Local workspace / engagement artifacts, never published
+.workbuddy/
+reports/

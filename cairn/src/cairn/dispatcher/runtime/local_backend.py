@@ -5,7 +5,7 @@ import os
 import shutil
 from pathlib import Path
 
-from cairn.dispatcher.config import LocalConfig
+from cairn.dispatcher.config import AuthConfig, LocalConfig
 from cairn.dispatcher.runtime.local_process import LocalProcess
 
 LOG = logging.getLogger(__name__)
@@ -21,13 +21,27 @@ class LocalBackend:
     build or tear down, so the container-lifecycle methods are inert.
     """
 
-    def __init__(self, config: LocalConfig):
+    def __init__(self, config: LocalConfig, auth_config: AuthConfig | None = None):
         self._config = config
+        self._auth_config = auth_config
         root = config.workspace_root
         self._root = Path(root).expanduser() if root else Path.cwd()
 
     def close(self) -> None:
         return None
+
+    def project_env(self, project_id: str) -> dict[str, str]:
+        """Environment variables injected into every local worker process.
+
+        In local mode the worker runs directly on the host, so ``CAIRN_AUTH_DIR`` points
+        at the host store directory ``<store_root>/<project_id>``. The agent still only
+        reads ``$CAIRN_AUTH_DIR`` and never knows whether it is a Docker mount or a host
+        path.
+        """
+        env = {"CAIRN_PROJECT_ID": project_id}
+        if self._auth_config is not None:
+            env["CAIRN_AUTH_DIR"] = f"{self._auth_config.store_root.rstrip('/')}/{project_id}"
+        return env
 
     def container_name(self, project_id: str) -> str:
         return str(self._project_dir(project_id))

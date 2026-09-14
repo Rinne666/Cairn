@@ -111,6 +111,7 @@ def run_explore_task(
             execute.argv,
             phase="explore_execute",
             timeout=config.tasks.explore.timeout,
+            project_id=project.project.id,
             lease=lease,
             cancellation=cancellation,
         )
@@ -312,6 +313,7 @@ def _try_conclude_fallback(
         conclude_argv,
         phase="explore_conclude",
         timeout=config.tasks.explore.conclude_timeout,
+        project_id=project_id,
         lease=lease,
         cancellation=cancellation,
     )
@@ -392,6 +394,7 @@ def _run_process(
     *,
     phase: str,
     timeout: int,
+    project_id: str,
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
 ):
@@ -402,6 +405,7 @@ def _run_process(
         argv,
         phase=phase,
         timeout_seconds=timeout,
+        project_id=project_id,
         lease=lease,
         cancellation=cancellation,
     )

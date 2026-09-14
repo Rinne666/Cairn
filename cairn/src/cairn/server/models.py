@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field, field_validator
 class Settings(BaseModel):
     intent_timeout: int = Field(ge=5)
     reason_timeout: int = Field(ge=5)
+    auth_claim_ttl: int = Field(default=300, ge=0)
+    auth_request_ttl: int = Field(default=1800, ge=0)
 
 
 class Fact(BaseModel):
@@ -242,3 +244,81 @@ class ReopenResponse(BaseModel):
     project: ProjectMeta
     fact: Fact
     intent: Intent
+
+
+AuthRequestStatus = Literal[
+    "pending",
+    "claimed",
+    "waiting_user",
+    "verifying",
+    "completed",
+    "failed",
+    "cancelled",
+    "expired",
+]
+
+ACTIVE_AUTH_REQUEST_STATUSES = (
+    "pending",
+    "claimed",
+    "waiting_user",
+    "verifying",
+)
+
+
+class AuthRequest(BaseModel):
+    id: str
+    project_id: str
+    source_fact_ids: list[str]
+    auth_ref: str
+    role: str
+    login_url: str | None = None
+    reason: str
+    status: AuthRequestStatus
+    claimed_by: str | None = None
+    created_at: str
+    claimed_at: str | None = None
+    completed_at: str | None = None
+    failure_reason: str | None = None
+
+
+class CreateAuthRequest(BaseModel):
+    source_fact_ids: list[str] = Field(min_length=1)
+    auth_ref: str
+    role: str
+    login_url: str | None = None
+    reason: str
+
+    @field_validator("auth_ref", "role", "reason")
+    @classmethod
+    def validate_non_empty_text(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+    @field_validator("source_fact_ids")
+    @classmethod
+    def validate_fact_ids(cls, value: list[str]) -> list[str]:
+        cleaned = []
+        for item in value:
+            text = item.strip()
+            if not text:
+                raise ValueError("fact ids must not be empty")
+            cleaned.append(text)
+        return cleaned
+
+
+class ClaimAuthRequest(BaseModel):
+    helper_id: str
+
+    @field_validator("helper_id")
+    @classmethod
+    def validate_non_empty_text(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+
+class FailAuthRequest(BaseModel):
+    failure_reason: str | None = None

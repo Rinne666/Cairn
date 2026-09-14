@@ -107,6 +107,9 @@ class FakeContainerManager:
     def write_text_file(self, container_name: str, path: str, content: str) -> None:
         self.writes.append((container_name, path, content))
 
+    def project_env(self, project_id: str) -> dict[str, str]:
+        return {"CAIRN_PROJECT_ID": project_id}
+
 
 @dataclass
 class FakeClient:
