@@ -87,6 +87,24 @@ def test_local_process_resolves_executable_from_supplied_path(tmp_path: Path) ->
     assert result.stdout.strip() == "path-shim-output"
 
 
+def test_local_process_resolves_executable_from_lowercase_windows_env(tmp_path: Path, monkeypatch) -> None:
+    import cairn.dispatcher.runtime.local_process as local_process_module
+
+    monkeypatch.setattr(local_process_module.os, "name", "nt")
+    monkeypatch.setattr(
+        local_process_module.shutil,
+        "which",
+        lambda candidate, path: str(tmp_path / "path-shim.cmd") if path == str(tmp_path) else None,
+    )
+    process = LocalProcess(
+        ["path-shim"],
+        cwd=str(tmp_path),
+        env={"path": str(tmp_path), "pathext": ".CMD"},
+        timeout_seconds=10,
+    )
+    assert process._resolve_command() == [str(tmp_path / "path-shim.cmd")]
+
+
 def test_local_process_uses_windows_process_group_creation(monkeypatch, tmp_path: Path) -> None:
     """Windows workers use a native process group instead of POSIX session flags."""
     import cairn.dispatcher.runtime.local_process as local_process_module
@@ -117,6 +135,7 @@ def test_local_process_uses_windows_process_group_creation(monkeypatch, tmp_path
         return FakeProcess()
 
     monkeypatch.setattr(local_process_module.os, "name", "nt")
+    monkeypatch.setattr(local_process_module.subprocess, "CREATE_NEW_PROCESS_GROUP", 1234, raising=False)
     monkeypatch.setattr(local_process_module.subprocess, "Popen", fake_popen)
     process = LocalProcess(["worker"], str(tmp_path), {"PATH": str(tmp_path)})
     process.start()

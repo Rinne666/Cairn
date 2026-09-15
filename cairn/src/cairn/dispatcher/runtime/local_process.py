@@ -149,8 +149,9 @@ class LocalProcess:
         if os.name != "nt" or not self.command:
             return self.command
         executable = self.command[0]
-        path = self.env.get("PATH") or self.env.get("Path") or ""
-        pathext = self.env.get("PATHEXT") or os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
+        env_lower = {key.lower(): value for key, value in self.env.items()}
+        path = env_lower.get("path") or ""
+        pathext = env_lower.get("pathext") or os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
         suffixes = tuple(ext.lower() for ext in pathext.split(";") if ext)
         candidates = [executable]
         if not os.path.splitext(executable)[1]:
