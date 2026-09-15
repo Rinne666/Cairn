@@ -17,13 +17,16 @@ from cairn.server.services import (
 router = APIRouter(tags=["auth-helper"])
 
 
-def _view(row) -> AuthHelperRequestView:
+def _view(conn, row) -> AuthHelperRequestView:
+    target = conn.execute(
+        "SELECT login_url FROM auth_target_configs WHERE auth_ref = ?", (row["auth_ref"],)
+    ).fetchone()
     return AuthHelperRequestView(
         id=row["id"],
         auth_ref=row["auth_ref"],
-        # AuthTargetConfig is dispatcher-owned and unavailable to this server
-        # projection. Never echo the raw request URL as an authority.
-        login_url=None,
+        # Never echo auth_requests.login_url; only a deployment-provisioned authority
+        # may be exposed to the helper.
+        login_url=target["login_url"] if target is not None else None,
         status=row["status"],
     )
 
@@ -47,7 +50,7 @@ def list_helper_pending(project_id: str, request: Request):
             """,
             (project_id,),
         ).fetchall()
-        return [_view(row) for row in rows]
+        return [_view(conn, row) for row in rows]
 
 
 @router.get(
@@ -66,4 +69,4 @@ def get_helper_view(project_id: str, request_id: str, request: Request):
             from fastapi import HTTPException
 
             raise HTTPException(404, "Auth request not found")
-        return _view(row)
+        return _view(conn, row)

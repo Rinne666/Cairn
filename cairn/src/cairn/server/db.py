@@ -151,6 +151,11 @@ CREATE TABLE IF NOT EXISTS auth_credentials (
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_credentials_actor ON auth_credentials (actor_id);
+
+CREATE TABLE IF NOT EXISTS auth_target_configs (
+    auth_ref TEXT PRIMARY KEY,
+    login_url TEXT NOT NULL
+);
 """
 
 
@@ -166,6 +171,10 @@ def configure(path: Path) -> None:
         _ensure_settings_columns(conn)
         _ensure_auth_request_columns(conn)
         _ensure_auth_schema(conn)
+        from cairn.server.services import bootstrap_auth_credentials, bootstrap_auth_target_configs
+
+        bootstrap_auth_credentials(conn)
+        bootstrap_auth_target_configs(conn)
 
 
 def _ensure_project_columns(conn: sqlite3.Connection) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query
 
 from cairn.server.db import get_conn
 from cairn.server.models import (
@@ -21,7 +21,6 @@ from cairn.server.services import (
     get_auth_request_or_404,
     get_auth_request_ttl,
     next_auth_request_id,
-    reject_migrated_helper_raw_listing,
     utcnow,
     validate_facts_exist,
     _join_source_fact_ids,
@@ -92,9 +91,8 @@ def create_auth_request(project_id: str, body: CreateAuthRequest):
     "/auth-requests",
     response_model=list[AuthRequest],
 )
-def list_auth_requests(request: Request, status: str | None = Query(default=None)):
+def list_auth_requests(status: str | None = Query(default=None)):
     with get_conn() as conn:
-        reject_migrated_helper_raw_listing(request, conn)
         _reap_expired(conn)
         if status is not None:
             rows = conn.execute(

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from datetime import timedelta
 from typing import Iterable
+from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
 
@@ -81,6 +82,88 @@ def provision_auth_credential(
     row = conn.execute("SELECT * FROM auth_credentials WHERE id = ?", (cursor.lastrowid,)).fetchone()
     assert row is not None
     return _credential_model(row)
+
+
+def bootstrap_auth_credentials(
+    conn: sqlite3.Connection,
+    *,
+    helper_token: str | None = None,
+    dispatcher_token: str | None = None,
+    helper_actor_id: str | None = None,
+    helper_scopes: Iterable[str] | None = None,
+    helper_project_allowlist: Iterable[str] | None = None,
+) -> None:
+    """Provision deployment credentials while keeping opaque tokens out of storage."""
+    helper_token = helper_token if helper_token is not None else os.getenv("CAIRN_AUTH_HELPER_TOKEN")
+    dispatcher_token = dispatcher_token if dispatcher_token is not None else os.getenv("CAIRN_AUTH_DISPATCHER_TOKEN")
+    if helper_token:
+        _upsert_deployment_credential(
+            conn,
+            helper_token,
+            actor_id=helper_actor_id or os.getenv("CAIRN_AUTH_HELPER_ACTOR_ID", "helper"),
+            scopes=helper_scopes if helper_scopes is not None else _csv_env("CAIRN_AUTH_HELPER_SCOPES", "helper.event.submit,helper.request.read"),
+            projects=helper_project_allowlist if helper_project_allowlist is not None else _csv_env("CAIRN_AUTH_HELPER_PROJECTS", "*"),
+        )
+    if dispatcher_token:
+        _upsert_deployment_credential(
+            conn,
+            dispatcher_token,
+            actor_id=os.getenv("CAIRN_AUTH_DISPATCHER_ACTOR_ID", "dispatcher"),
+            scopes=_csv_env("CAIRN_AUTH_DISPATCHER_SCOPES", "dispatcher.auth.consume"),
+            projects=_csv_env("CAIRN_AUTH_DISPATCHER_PROJECTS", "*"),
+        )
+
+
+def _csv_env(name: str, default: str) -> list[str]:
+    return sorted({item.strip() for item in os.getenv(name, default).split(",") if item.strip()})
+
+
+def _upsert_deployment_credential(
+    conn: sqlite3.Connection,
+    token: str,
+    *,
+    actor_id: str,
+    scopes: Iterable[str],
+    projects: Iterable[str],
+) -> None:
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    encoded_scopes = json.dumps(sorted({value.strip() for value in scopes if value.strip()}))
+    encoded_projects = json.dumps(sorted({value.strip() for value in projects if value.strip()}))
+    now = utcnow()
+    existing = conn.execute("SELECT id FROM auth_credentials WHERE token_digest = ?", (digest,)).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO auth_credentials (token_digest, actor_id, scopes, project_allowlist, not_before, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (digest, actor_id, encoded_scopes, encoded_projects, now, now),
+        )
+    else:
+        conn.execute(
+            "UPDATE auth_credentials SET actor_id = ?, scopes = ?, project_allowlist = ? WHERE id = ?",
+            (actor_id, encoded_scopes, encoded_projects, existing["id"]),
+        )
+
+
+def bootstrap_auth_target_configs(conn: sqlite3.Connection) -> None:
+    """Load validated HTTPS target authorities from deployment-only JSON."""
+    raw = os.getenv("CAIRN_AUTH_TARGET_URLS")
+    if not raw:
+        return
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(values, dict):
+        return
+    for auth_ref, login_url in values.items():
+        if not isinstance(auth_ref, str) or not isinstance(login_url, str):
+            continue
+        parsed = urlparse(login_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            continue
+        conn.execute(
+            "INSERT INTO auth_target_configs (auth_ref, login_url) VALUES (?, ?) ON CONFLICT(auth_ref) DO UPDATE SET login_url = excluded.login_url",
+            (auth_ref.strip(), login_url),
+        )
 
 
 def lookup_auth_credential(
