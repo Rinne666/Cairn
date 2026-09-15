@@ -171,10 +171,9 @@ def configure(path: Path) -> None:
         _ensure_settings_columns(conn)
         _ensure_auth_request_columns(conn)
         _ensure_auth_schema(conn)
-        from cairn.server.services import bootstrap_auth_credentials, bootstrap_auth_target_configs
+        from cairn.server.services import bootstrap_auth_deployment
 
-        bootstrap_auth_credentials(conn)
-        bootstrap_auth_target_configs(conn)
+        bootstrap_auth_deployment(conn)
 
 
 def _ensure_project_columns(conn: sqlite3.Connection) -> None:

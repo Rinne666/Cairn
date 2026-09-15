@@ -13,6 +13,7 @@ from cairn.server import db
 from cairn.server.app import app
 from cairn.server.models import CreateAuthEvent
 from cairn.server.services import (
+    bootstrap_auth_deployment,
     lookup_auth_credential,
     provision_auth_credential,
     revoke_auth_credential,
@@ -117,14 +118,21 @@ def test_legacy_helper_listing_remains_available_until_helper_event_migration(cl
 
 
 def test_deployment_bootstrap_hashes_helper_and_dispatcher_tokens_without_plaintext(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("CAIRN_AUTH_HELPER_TOKEN", "helper-deployment-secret")
-    monkeypatch.setenv("CAIRN_AUTH_HELPER_ACTOR_ID", "desktop-helper")
-    monkeypatch.setenv("CAIRN_AUTH_HELPER_SCOPES", "helper.event.submit,helper.request.read")
-    monkeypatch.setenv("CAIRN_AUTH_HELPER_PROJECTS", "proj_001,proj_002")
-    monkeypatch.setenv("CAIRN_AUTH_DISPATCHER_TOKEN", "dispatcher-deployment-secret")
+    from cairn.dispatcher.config import AuthConfig
+
+    monkeypatch.setenv("AUTH_HELPER_SECRET", "helper-deployment-secret")
     monkeypatch.setattr(db, "_db_path", None)
     db.configure(tmp_path / "bootstrap.db")
     with db.get_conn() as conn:
+        config = AuthConfig.model_validate({
+            "store_root": "/tmp/auth",
+            "helper_token_env": "AUTH_HELPER_SECRET",
+            "helper_actor_id": "desktop-helper",
+            "helper_scopes": ["helper.event.submit", "helper.request.read"],
+            "helper_project_allowlist": ["proj_001", "proj_002"],
+            "targets": [{"name": "target-user", "base_url": "https://example.test", "login_url": "https://example.test/login", "role": "user", "verify": {"url": "https://example.test/me"}}],
+        })
+        bootstrap_auth_deployment(conn, auth_config=config, dispatcher_token="dispatcher-deployment-secret")
         rows = conn.execute("SELECT * FROM auth_credentials ORDER BY actor_id").fetchall()
         assert [row["actor_id"] for row in rows] == ["desktop-helper", "dispatcher"]
         assert all("deployment-secret" not in row["token_digest"] for row in rows)
@@ -133,10 +141,10 @@ def test_deployment_bootstrap_hashes_helper_and_dispatcher_tokens_without_plaint
 
 
 def test_helper_view_uses_configured_target_authority(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("CAIRN_AUTH_TARGET_URLS", '{"target-user":"https://configured.example/login"}')
     monkeypatch.setattr(db, "_db_path", None)
     db.configure(tmp_path / "target-authority.db")
     with db.get_conn() as conn:
+        bootstrap_auth_deployment(conn, target_configs={"target-user": "https://configured.example/login"})
         conn.execute("INSERT INTO projects (id, title, status, bootstrap_enabled, created_at) VALUES ('proj_001', 'test', 'active', 1, '2099-01-01T00:00:00Z')")
         conn.execute("INSERT INTO auth_requests (id, project_id, source_fact_ids, auth_ref, role, login_url, reason, status, created_at) VALUES ('auth_001', 'proj_001', 'origin', 'target-user', 'user', 'https://untrusted.example/login', 'secret', 'pending', '2099-01-01T00:00:00Z')")
         provision_auth_credential(conn, "helper-token", actor_id="helper-a", scopes={"helper.request.read"}, project_allowlist={"proj_001"})
@@ -144,6 +152,16 @@ def test_helper_view_uses_configured_target_authority(tmp_path, monkeypatch) -> 
         response = configured.get("/projects/proj_001/auth-requests/auth_001/helper-view", headers=_headers())
     assert response.status_code == 200
     assert response.json()["login_url"] == "https://configured.example/login"
+
+
+def test_target_authority_snapshot_replaces_stale_targets_atomically(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(tmp_path / "target-snapshot.db")
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO auth_target_configs VALUES ('stale', 'https://stale.example/login')")
+        bootstrap_auth_deployment(conn, target_configs={"fresh": "https://fresh.example/login"})
+        rows = conn.execute("SELECT auth_ref, login_url FROM auth_target_configs ORDER BY auth_ref").fetchall()
+    assert [(row["auth_ref"], row["login_url"]) for row in rows] == [("fresh", "https://fresh.example/login")]
 
 
 def test_transport_guard_rejects_non_loopback_cleartext(client: TestClient) -> None:

@@ -114,6 +114,54 @@ def bootstrap_auth_credentials(
         )
 
 
+def bootstrap_auth_deployment(
+    conn: sqlite3.Connection,
+    *,
+    auth_config: object | None = None,
+    dispatcher_token: str | None = None,
+    target_configs: dict[str, str] | None = None,
+) -> None:
+    """Apply one deployment's AuthConfig snapshot atomically.
+
+    Dispatcher owns the AuthConfig. In a split deployment it supplies a serialized
+    snapshot through the deployment mechanism; this function accepts that snapshot
+    (or the concrete config object in local mode), while never persisting raw tokens.
+    """
+    helper_token_env = getattr(auth_config, "helper_token_env", "CAIRN_AUTH_HELPER_TOKEN")
+    helper_actor_id = getattr(auth_config, "helper_actor_id", "helper")
+    helper_scopes = getattr(auth_config, "helper_scopes", None)
+    helper_projects = getattr(auth_config, "helper_project_allowlist", None)
+    helper_token = os.getenv(helper_token_env)
+    if auth_config is None:
+        snapshot_raw = os.getenv("CAIRN_AUTH_DEPLOYMENT_SNAPSHOT")
+        snapshot: dict = {}
+        if snapshot_raw:
+            try:
+                parsed = json.loads(snapshot_raw)
+                snapshot = parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                snapshot = {}
+        helper_token = snapshot.get("helper_token", helper_token)
+        dispatcher_token = snapshot.get("dispatcher_token", dispatcher_token)
+        helper_actor_id = snapshot.get("helper_actor_id", helper_actor_id)
+        helper_scopes = snapshot.get("helper_scopes", helper_scopes)
+        helper_projects = snapshot.get("helper_project_allowlist", helper_projects)
+        target_configs = snapshot.get("targets", target_configs)
+    bootstrap_auth_credentials(
+        conn,
+        helper_token=helper_token,
+        dispatcher_token=dispatcher_token,
+        helper_actor_id=helper_actor_id,
+        helper_scopes=helper_scopes,
+        helper_project_allowlist=helper_projects,
+    )
+    if target_configs is None and auth_config is not None:
+        target_configs = {
+            target.name: target.login_url
+            for target in getattr(auth_config, "targets", [])
+        }
+    if target_configs is not None:
+        bootstrap_auth_target_configs(conn, target_configs)
 def _csv_env(name: str, default: str) -> list[str]:
     return sorted({item.strip() for item in os.getenv(name, default).split(",") if item.strip()})
 
@@ -143,17 +191,11 @@ def _upsert_deployment_credential(
         )
 
 
-def bootstrap_auth_target_configs(conn: sqlite3.Connection) -> None:
-    """Load validated HTTPS target authorities from deployment-only JSON."""
-    raw = os.getenv("CAIRN_AUTH_TARGET_URLS")
-    if not raw:
+def bootstrap_auth_target_configs(conn: sqlite3.Connection, values: dict[str, str] | None = None) -> None:
+    """Replace target authorities with one validated Dispatcher-owned snapshot."""
+    if values is None:
         return
-    try:
-        values = json.loads(raw)
-    except json.JSONDecodeError:
-        return
-    if not isinstance(values, dict):
-        return
+    conn.execute("DELETE FROM auth_target_configs")
     for auth_ref, login_url in values.items():
         if not isinstance(auth_ref, str) or not isinstance(login_url, str):
             continue

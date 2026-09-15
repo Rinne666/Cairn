@@ -36,6 +36,26 @@ def test_dispatch_config_accepts_server_token_and_client_injects_bearer_header()
         client.close()
 
 
+def test_dispatch_config_snapshot_links_server_and_helper_authority(monkeypatch) -> None:
+    payload = make_config().model_dump()
+    payload["server_token"] = "dispatcher-secret"
+    payload["auth"] = {
+        "store_root": "/tmp/auth",
+        "helper_token_env": "TEST_HELPER_TOKEN",
+        "helper_actor_id": "desktop-helper",
+        "helper_scopes": ["helper.event.submit"],
+        "helper_project_allowlist": ["proj_001"],
+        "targets": [{"name": "target-user", "base_url": "https://example.test", "login_url": "https://example.test/login", "role": "user", "verify": {"url": "https://example.test/me"}}],
+    }
+    monkeypatch.setenv("TEST_HELPER_TOKEN", "helper-secret")
+    config = DispatchConfig.model_validate(payload)
+    snapshot = config.auth_deployment_snapshot()
+    assert snapshot["dispatcher_token"] == "dispatcher-secret"
+    assert snapshot["helper_token"] == "helper-secret"
+    assert snapshot["helper_scopes"] == ["helper.event.submit"]
+    assert snapshot["targets"] == {"target-user": "https://example.test/login"}
+
+
 def test_dispatch_config_defaults_worker_healthcheck_and_rejects_unknown_mode() -> None:
     payload = make_config().model_dump()
     payload["runtime"].pop("worker_healthcheck")

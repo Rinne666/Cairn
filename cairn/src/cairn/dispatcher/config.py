@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 import json
+import os
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
@@ -191,6 +192,7 @@ class AuthConfig(BaseModel):
 
     # Helper credentials are supplied by deployment environment, not graph payloads.
     helper_token_env: str = "CAIRN_AUTH_HELPER_TOKEN"
+    helper_actor_id: str = "helper"
     helper_scopes: list[str] = Field(default_factory=lambda: ["helper.event.submit", "helper.request.read"])
     helper_project_allowlist: list[str] = Field(default_factory=list)
 
@@ -338,6 +340,26 @@ class DispatchConfig(BaseModel):
             if self.local is None:
                 self.local = LocalConfig()
         return self
+
+    def auth_deployment_snapshot(self) -> dict[str, Any]:
+        """Return the deployment-only Server bootstrap payload for this config.
+
+        The payload is intended for an environment/secret manager handoff to the
+        Server. Callers must not log or persist it in graph/protocol records.
+        """
+        snapshot: dict[str, Any] = {"dispatcher_token": self.server_token}
+        if self.auth is None:
+            return snapshot
+        snapshot.update(
+            {
+                "helper_token": os.environ.get(self.auth.helper_token_env),
+                "helper_actor_id": self.auth.helper_actor_id,
+                "helper_scopes": list(self.auth.helper_scopes),
+                "helper_project_allowlist": list(self.auth.helper_project_allowlist),
+                "targets": {target.name: target.login_url for target in self.auth.targets},
+            }
+        )
+        return snapshot
 
     @classmethod
     def load(cls, path: Path) -> "DispatchConfig":
