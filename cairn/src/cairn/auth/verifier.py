@@ -32,18 +32,27 @@ class AuthVerifier:
         target: AuthTargetConfig,
         storage_state: dict[str, Any],
     ) -> AuthVerificationResult:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import Error, sync_playwright
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                context = browser.new_context(storage_state=storage_state)
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
                 try:
-                    return self._verify_context(target, context)
+                    context = browser.new_context(storage_state=storage_state)
+                    try:
+                        return self._verify_context(target, context)
+                    finally:
+                        context.close()
                 finally:
-                    context.close()
-            finally:
-                browser.close()
+                    browser.close()
+        except Error as exc:
+            return AuthVerificationResult(
+                valid=False,
+                page_ok=False,
+                selector_ok=False,
+                api_ok=False,
+                reason=str(exc),
+            )
 
     def verify_profile(self, target: AuthTargetConfig, state_path: str) -> AuthVerificationResult:
         import json

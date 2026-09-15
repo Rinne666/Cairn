@@ -34,7 +34,7 @@ class AuthManager:
         verify_timeout_seconds: int = 30,
         on_status: Any | None = None,
     ) -> AuthCaptureResult:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import Error, sync_playwright
 
         verifier = AuthVerifier(timeout_ms=verify_timeout_seconds * 1000)
 
@@ -66,7 +66,7 @@ class AuthManager:
                     report("Login timed out before an authenticated session was verified.")
                     return AuthCaptureResult(storage_state=None, verification=_invalid_timeout())
 
-                storage_state = context.storage_state()
+                storage_state = context.storage_state(indexed_db=target.indexed_db)
                 return AuthCaptureResult(storage_state=storage_state, verification=verification)
             finally:
                 browser.close()
@@ -80,6 +80,7 @@ class AuthManager:
         timeout_seconds: int,
     ):
         import time
+        from playwright.sync_api import Error
 
         deadline = time.monotonic() + timeout_seconds
         page = context.new_page()
@@ -89,7 +90,10 @@ class AuthManager:
                 # appears logged in, run the full authoritative verification against the
                 # live context (including the authenticated API layer).
                 if self._probe(target, verifier, page):
-                    return verifier._verify_context(target, context)
+                    try:
+                        return verifier._verify_context(target, context)
+                    except Error as exc:
+                        return _invalid_browser_error(exc)
                 time.sleep(1)
             return None
         finally:
@@ -121,4 +125,16 @@ def _invalid_timeout():
         selector_ok=False,
         api_ok=False,
         reason="login timed out",
+    )
+
+
+def _invalid_browser_error(exc: Exception):
+    from cairn.auth.models import AuthVerificationResult
+
+    return AuthVerificationResult(
+        valid=False,
+        page_ok=False,
+        selector_ok=False,
+        api_ok=False,
+        reason=str(exc),
     )
