@@ -48,7 +48,7 @@ class _InterventionClient(FakeClient):
 
 
 def test_reason_creates_auth_request_from_intervention(monkeypatch) -> None:
-    config = make_config()
+    config = _config_with_auth([])
     project = make_project()
     client = _InterventionClient(project)
     containers = FakeContainerManager()
@@ -84,7 +84,7 @@ def test_reason_creates_auth_request_from_intervention(monkeypatch) -> None:
 
 
 def test_reason_creates_intents_and_interventions_together(monkeypatch) -> None:
-    config = make_config()
+    config = _config_with_auth([], target_name="target-admin", target_role="admin")
     project = make_project()
     client = _InterventionClient(project)
     containers = FakeContainerManager()
@@ -155,14 +155,18 @@ def test_reason_noop_returns_success(monkeypatch) -> None:
     assert client.created_auth_requests == []
 
 
-def _config_with_auth(allow_roles: list[str] | None, target_role: str = "user") -> DispatchConfig:
+def _config_with_auth(
+    allow_roles: list[str] | None,
+    target_role: str = "user",
+    target_name: str = "target-user",
+) -> DispatchConfig:
     base = make_config().model_dump()
     base["auth"] = {
         "store_root": "/opt/cairn/auth",
         "intervention": {"allow_roles": allow_roles or []},
         "targets": [
             {
-                "name": "target-user",
+                "name": target_name,
                 "base_url": "https://t.example.com",
                 "login_url": "https://t.example.com/login",
                 "role": target_role,
@@ -262,4 +266,61 @@ def test_unknown_target_skipped(monkeypatch) -> None:
     )
 
     assert outcome == "success"
+    assert client.created_auth_requests == []
+
+
+def test_intervention_is_skipped_when_auth_config_is_missing(monkeypatch) -> None:
+    config = make_config()
+    project = make_project()
+    client = _InterventionClient(project)
+
+    outcome = _run_reason_with_intervention(
+        monkeypatch,
+        config,
+        project,
+        client,
+        '{"accepted":true,"data":{"interventions":[{"type":"auth","from":["f001"],'
+        '"target":"target-user","role":"user","reason":"need auth"}]}}',
+    )
+
+    assert outcome == "success"
+    assert client.created_auth_requests == []
+
+
+def test_intervention_is_skipped_when_auth_interventions_are_disabled(monkeypatch) -> None:
+    config = _config_with_auth([])
+    config.auth.intervention.enabled = False
+    project = make_project()
+    client = _InterventionClient(project)
+
+    outcome = _run_reason_with_intervention(
+        monkeypatch,
+        config,
+        project,
+        client,
+        '{"accepted":true,"data":{"interventions":[{"type":"auth","from":["f001"],'
+        '"target":"target-user","role":"user","reason":"need auth"}]}}',
+    )
+
+    assert outcome == "success"
+    assert client.created_auth_requests == []
+
+
+def test_blocked_intervention_does_not_block_normal_intent(monkeypatch) -> None:
+    config = make_config()
+    project = make_project()
+    client = _InterventionClient(project)
+
+    outcome = _run_reason_with_intervention(
+        monkeypatch,
+        config,
+        project,
+        client,
+        '{"accepted":true,"data":{"intents":[{"from":["f001"],"description":"public api"}],'
+        '"interventions":[{"type":"auth","from":["f002"],"target":"target-user",'
+        '"role":"user","reason":"need auth"}]}}',
+    )
+
+    assert outcome == "success"
+    assert client.created_intents == [("proj_001", ["f001"], "public api", "test-worker")]
     assert client.created_auth_requests == []

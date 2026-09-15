@@ -267,34 +267,43 @@ def run_reason_task(
                 continue
             auth_ref = intervention["target"]
             role = intervention["role"]
+            if config.auth is None or not config.auth.intervention.enabled:
+                LOG.warning(
+                    "reason auth request blocked because auth intervention is disabled "
+                    "project=%s worker=%s auth_ref=%s",
+                    project.project.id,
+                    worker.name,
+                    auth_ref,
+                )
+                intervention_count += 1  # handled: recognized and deliberately skipped
+                continue
             # Authoritative role comes from config, not the LLM output, so a worker
             # cannot forge a role to bypass allow_roles. Enforce the allow-list here
             # (the server does not hold dispatch config).
-            if config.auth is not None:
-                try:
-                    target_cfg = config.auth.target(auth_ref)
-                except KeyError:
-                    LOG.warning(
-                        "reason auth request skipped unknown target project=%s worker=%s auth_ref=%s",
-                        project.project.id,
-                        worker.name,
-                        auth_ref,
-                    )
-                    intervention_count += 1  # handled: recognized and deliberately skipped
-                    continue
-                role = target_cfg.role
-                allowed = config.auth.intervention.allow_roles
-                if allowed and role not in allowed:
-                    LOG.warning(
-                        "reason auth request blocked by allow_roles project=%s worker=%s auth_ref=%s role=%s allowed=%s",
-                        project.project.id,
-                        worker.name,
-                        auth_ref,
-                        role,
-                        allowed,
-                    )
-                    intervention_count += 1  # handled: recognized and deliberately skipped
-                    continue
+            try:
+                target_cfg = config.auth.target(auth_ref)
+            except KeyError:
+                LOG.warning(
+                    "reason auth request skipped unknown target project=%s worker=%s auth_ref=%s",
+                    project.project.id,
+                    worker.name,
+                    auth_ref,
+                )
+                intervention_count += 1  # handled: recognized and deliberately skipped
+                continue
+            role = target_cfg.role
+            allowed = config.auth.intervention.allow_roles
+            if allowed and role not in allowed:
+                LOG.warning(
+                    "reason auth request blocked by allow_roles project=%s worker=%s auth_ref=%s role=%s allowed=%s",
+                    project.project.id,
+                    worker.name,
+                    auth_ref,
+                    role,
+                    allowed,
+                )
+                intervention_count += 1  # handled: recognized and deliberately skipped
+                continue
             response = client.create_auth_request(
                 project_id=project.project.id,
                 source_fact_ids=intervention["from"],
