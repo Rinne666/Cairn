@@ -189,6 +189,11 @@ class AuthConfig(BaseModel):
 
     verify_timeout: int = Field(default=30, gt=0)
 
+    # Helper credentials are supplied by deployment environment, not graph payloads.
+    helper_token_env: str = "CAIRN_AUTH_HELPER_TOKEN"
+    helper_scopes: list[str] = Field(default_factory=lambda: ["helper.event.submit", "helper.request.read"])
+    helper_project_allowlist: list[str] = Field(default_factory=list)
+
     targets: list[AuthTargetConfig] = Field(default_factory=list)
 
     intervention: AuthInterventionConfig = Field(default_factory=AuthInterventionConfig)
@@ -259,6 +264,8 @@ class DispatchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     server: str
+    # Opaque Dispatcher credential; only its digest is provisioned by the Server.
+    server_token: str | None = None
     runtime: RuntimeConfig
     tasks: TasksConfig
     container: ContainerConfig | None = None

@@ -310,6 +310,7 @@ def dispatch(config_path: Path, once: bool, startup_healthcheck_only: bool, log_
     help="Dispatcher config path (contains the auth targets)",
 )
 @click.option("--helper-name", "helper_id", default=None, help="Helper identifier (default hostname-username)")
+@click.option("--token-env", default="CAIRN_AUTH_HELPER_TOKEN", show_default=True, help="Environment variable containing the helper bearer token")
 @click.option("--poll-interval", type=float, default=2.0, show_default=True, help="Poll interval in seconds")
 @click.option("--notification/--no-notification", default=True, show_default=True, help="Enable desktop notifications")
 @click.option("--auto-launch/--no-auto-launch", default=True, show_default=True, help="Auto-launch the headed login browser")
@@ -319,6 +320,7 @@ def auth_helper(
     server: str,
     config_path: Path,
     helper_id: str | None,
+    token_env: str,
     poll_interval: float,
     notification: bool,
     auto_launch: bool,
@@ -333,10 +335,13 @@ def auth_helper(
     )
 
     configure_logging(log_level)
+    import os
+
     config = AuthHelperConfig(
         server=server,
         config_path=config_path,
         helper_id=helper_id or default_helper_id(),
+        token=os.environ.get(token_env),
         poll_interval=poll_interval,
         notification=notification,
         auto_launch=auto_launch,

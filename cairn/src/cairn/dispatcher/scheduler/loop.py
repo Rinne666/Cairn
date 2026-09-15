@@ -44,7 +44,7 @@ class DispatcherLoop:
     def __init__(self, config_path: Path):
         self.config_path = config_path
         self.config = DispatchConfig.load(config_path)
-        self.client = CairnClient(self.config.server)
+        self.client = CairnClient(self.config.server, server_token=self.config.server_token)
         if self.config.runtime.execution == "local":
             self.container_manager = LocalBackend(self.config.local or LocalConfig(), self.config.auth)
         else:

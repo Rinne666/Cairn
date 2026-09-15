@@ -33,9 +33,10 @@ class ApiResult:
 
 
 class CairnClient:
-    def __init__(self, base_url: str, timeout: float = 10.0):
+    def __init__(self, base_url: str, timeout: float = 10.0, server_token: str | None = None):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._server_token = server_token
         self._summary_adapter = TypeAdapter(list[ProjectSummary])
         self._local = threading.local()
         self._sessions: dict[int, requests.Session] = {}
@@ -203,6 +204,8 @@ class CairnClient:
             return session
 
         session = requests.Session()
+        if self._server_token:
+            session.headers.update({"Authorization": f"Bearer {self._server_token}"})
         adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, pool_block=False)
         session.mount("http://", adapter)
         session.mount("https://", adapter)

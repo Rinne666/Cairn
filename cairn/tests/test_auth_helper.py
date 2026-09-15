@@ -102,6 +102,16 @@ def _config(tmp_path: Path) -> AuthHelperConfig:
     )
 
 
+def test_helper_config_injects_its_own_bearer_token(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.token = "helper-secret"
+    daemon = AuthHelperDaemon(config)
+    try:
+        assert daemon._client.client._session().headers["Authorization"] == "Bearer helper-secret"
+    finally:
+        daemon._client.client.close()
+
+
 def test_default_helper_id_is_hostname_username() -> None:
     helper_id = default_helper_id()
     assert helper_id

@@ -35,6 +35,8 @@ class AuthHelperConfig:
     server: str
     config_path: Path
     helper_id: str
+    # Read from deployment environment; never place this opaque token in graph data.
+    token: str | None = None
     poll_interval: float = 2.0
     notification: bool = True
     auto_launch: bool = True
@@ -64,7 +66,7 @@ class AuthHelperDaemon:
         launcher: AuthLoginLauncher | None = None,
     ):
         self.config = config
-        self._client = client or AuthHelperClient(CairnClient(config.server))
+        self._client = client or AuthHelperClient(CairnClient(config.server, server_token=config.token))
         self._notifier = notifier or DesktopNotifier(enabled=config.notification)
         self._launcher = launcher
         self._running = True

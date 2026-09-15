@@ -4,6 +4,7 @@ import sqlite3
 import hashlib
 import ipaddress
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -200,20 +201,42 @@ def require_secure_bearer_transport(request: Request) -> None:
         "",
     )
     proxy_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
-    if request.url.scheme.lower() == "https" or proxy_proto == "https" or forwarded_proto.lower() == "https":
+    client_host = (request.client.host if request.client else "").strip("[]").lower()
+    proxy_marked_https = (proxy_proto == "https" or forwarded_proto.lower() == "https") and _is_trusted_proxy(client_host)
+    if request.url.scheme.lower() == "https" or proxy_marked_https:
         return
-    hosts = {
-        (request.client.host if request.client else "").strip("[]").lower(),
-        (request.url.hostname or "").strip("[]").lower(),
-    }
-    is_loopback = False
-    for host in hosts:
-        try:
-            is_loopback = is_loopback or ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            is_loopback = is_loopback or host in {"localhost", "localhost.localdomain"}
+    try:
+        is_loopback = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        is_loopback = False
     if not is_loopback:
         raise HTTPException(400, "Bearer credentials require HTTPS")
+
+
+def _is_trusted_proxy(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    configured = os.getenv("CAIRN_TRUSTED_PROXY_NETWORKS", "127.0.0.0/8,::1/128")
+    for raw_network in configured.split(","):
+        try:
+            if address in ipaddress.ip_network(raw_network.strip(), strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def reject_migrated_helper_raw_listing(request: Request, conn: sqlite3.Connection) -> None:
+    """Deny migrated helper credentials while retaining unauthenticated legacy access."""
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return
+    principal = lookup_auth_credential(conn, token.strip())
+    if principal is not None and {"helper.request.read", "helper.event.submit"} & principal.scopes:
+        raise HTTPException(403, "Forbidden")
 
 
 def auth_event_to_model(row: sqlite3.Row) -> AuthEvent:

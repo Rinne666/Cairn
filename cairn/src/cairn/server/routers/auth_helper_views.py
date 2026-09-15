@@ -4,7 +4,15 @@ from fastapi import APIRouter, Request
 
 from cairn.server.db import get_conn
 from cairn.server.models import AuthHelperRequestView
-from cairn.server.services import get_auth_request_or_404, get_project_or_404, require_auth_principal
+from cairn.server.services import (
+    expire_stale_claims,
+    expire_stale_requests,
+    get_auth_claim_ttl,
+    get_auth_request_or_404,
+    get_auth_request_ttl,
+    get_project_or_404,
+    require_auth_principal,
+)
 
 router = APIRouter(tags=["auth-helper"])
 
@@ -13,7 +21,9 @@ def _view(row) -> AuthHelperRequestView:
     return AuthHelperRequestView(
         id=row["id"],
         auth_ref=row["auth_ref"],
-        login_url=row["login_url"],
+        # AuthTargetConfig is dispatcher-owned and unavailable to this server
+        # projection. Never echo the raw request URL as an authority.
+        login_url=None,
         status=row["status"],
     )
 
@@ -26,6 +36,8 @@ def list_helper_pending(project_id: str, request: Request):
     with get_conn() as conn:
         require_auth_principal(request, conn, scope="helper.request.read", project_id=project_id)
         get_project_or_404(conn, project_id)
+        expire_stale_claims(conn, get_auth_claim_ttl(conn))
+        expire_stale_requests(conn, get_auth_request_ttl(conn))
         rows = conn.execute(
             """
             SELECT id, auth_ref, login_url, status
@@ -46,6 +58,8 @@ def get_helper_view(project_id: str, request_id: str, request: Request):
     with get_conn() as conn:
         require_auth_principal(request, conn, scope="helper.request.read", project_id=project_id)
         get_project_or_404(conn, project_id)
+        expire_stale_claims(conn, get_auth_claim_ttl(conn))
+        expire_stale_requests(conn, get_auth_request_ttl(conn))
         row = get_auth_request_or_404(conn, request_id)
         if row["project_id"] != project_id:
             # Avoid cross-project existence leaks from helper-scoped views.

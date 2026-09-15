@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig, validate_prompt_resources
 from cairn.dispatcher.workers.adapters.codex import CodexDriver
 from cairn.dispatcher.workers.adapters.pi import PiDriver
+from cairn.dispatcher.protocol.client import CairnClient
 
 from conftest import make_config
 
@@ -21,6 +22,18 @@ def test_dispatch_config_merges_common_env_with_worker_override() -> None:
 
     assert config.workers[0].env["SHARED"] == "common"
     assert config.workers[0].env["OVERRIDE"] == "worker"
+
+
+def test_dispatch_config_accepts_server_token_and_client_injects_bearer_header() -> None:
+    payload = make_config().model_dump()
+    payload["server_token"] = "dispatcher-secret"
+    config = DispatchConfig.model_validate(payload)
+    assert config.server_token == "dispatcher-secret"
+    client = CairnClient(config.server, server_token=config.server_token)
+    try:
+        assert client._session().headers["Authorization"] == "Bearer dispatcher-secret"
+    finally:
+        client.close()
 
 
 def test_dispatch_config_defaults_worker_healthcheck_and_rejects_unknown_mode() -> None:

@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 from pydantic import ValidationError
 
 from cairn.server import db
@@ -16,6 +17,7 @@ from cairn.server.services import (
     provision_auth_credential,
     revoke_auth_credential,
     rotate_auth_credential,
+    require_secure_bearer_transport,
 )
 
 
@@ -28,7 +30,7 @@ def client(tmp_path, monkeypatch) -> TestClient:
             "INSERT INTO projects (id, title, status, bootstrap_enabled, created_at) VALUES ('proj_001', 'test', 'active', 1, '2026-01-01T00:00:00Z')"
         )
         conn.execute(
-            "INSERT INTO auth_requests (id, project_id, source_fact_ids, auth_ref, role, login_url, reason, status, created_at) VALUES ('auth_001', 'proj_001', 'origin', 'target-user', 'user', 'https://example.test/login', 'secret reason', 'pending', '2026-01-01T00:00:00Z')"
+            "INSERT INTO auth_requests (id, project_id, source_fact_ids, auth_ref, role, login_url, reason, status, created_at) VALUES ('auth_001', 'proj_001', 'origin', 'target-user', 'user', 'https://example.test/login', 'secret reason', 'pending', '2099-01-01T00:00:00Z')"
         )
         provision_auth_credential(
             conn,
@@ -37,7 +39,7 @@ def client(tmp_path, monkeypatch) -> TestClient:
             scopes={"helper.event.submit", "helper.request.read"},
             project_allowlist={"proj_001"},
         )
-    with TestClient(app) as test_client:
+    with TestClient(app, base_url="https://testserver") as test_client:
         yield test_client
 
 
@@ -98,6 +100,7 @@ def test_helper_view_is_scoped_and_redacts_legacy_fields(client: TestClient) -> 
     )
     assert pending.status_code == 200
     assert set(pending.json()[0]) == {"id", "auth_ref", "login_url", "status"}
+    assert pending.json()[0]["login_url"] is None
     assert "reason" not in pending.json()[0]
 
     view = client.get(
@@ -107,9 +110,44 @@ def test_helper_view_is_scoped_and_redacts_legacy_fields(client: TestClient) -> 
     assert set(view.json()) == {"id", "auth_ref", "login_url", "status"}
 
 
+def test_migrated_helper_cannot_use_global_raw_auth_request_listing(client: TestClient) -> None:
+    response = client.get("/auth-requests", headers=_headers(proto="https"))
+    assert response.status_code == 403
+
+
 def test_transport_guard_rejects_non_loopback_cleartext(client: TestClient) -> None:
-    response = client.post("/auth-events", json=_event(), headers=_headers())
+    with TestClient(app, base_url="http://remote.example") as insecure:
+        response = insecure.post("/auth-events", json=_event(), headers=_headers())
     assert response.status_code == 400
+
+
+def test_transport_guard_rejects_untrusted_forwarded_https() -> None:
+    scope = {
+        "type": "http", "scheme": "http", "server": ("remote.example", 80),
+        "client": ("203.0.113.10", 12345), "path": "/", "raw_path": b"/",
+        "query_string": b"", "headers": [(b"x-forwarded-proto", b"https")], "http_version": "1.1",
+    }
+    with pytest.raises(Exception):
+        require_secure_bearer_transport(Request(scope))
+
+
+def test_transport_guard_accepts_actual_loopback_cleartext() -> None:
+    scope = {
+        "type": "http", "scheme": "http", "server": ("127.0.0.1", 80),
+        "client": ("127.0.0.1", 12345), "path": "/", "raw_path": b"/",
+        "query_string": b"", "headers": [], "http_version": "1.1",
+    }
+    require_secure_bearer_transport(Request(scope))
+
+
+def test_helper_views_reap_stale_claims_and_requests(client: TestClient) -> None:
+    with db.get_conn() as conn:
+        conn.execute("UPDATE auth_requests SET status = 'claimed', claimed_at = '2000-01-01T00:00:00Z' WHERE id = 'auth_001'")
+        conn.execute("UPDATE auth_requests SET created_at = '2000-01-01T00:00:00Z' WHERE id = 'auth_001'")
+    result = client.get("/projects/proj_001/auth-requests/helper-pending", headers=_headers())
+    assert result.status_code == 200
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT status FROM auth_requests WHERE id = 'auth_001'").fetchone()["status"] == "expired"
 
 
 def test_credential_digest_rotation_scope_and_revocation(tmp_path, monkeypatch) -> None:
