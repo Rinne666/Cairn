@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import subprocess
+import sys
 import threading
 from typing import Any
 
@@ -19,6 +20,7 @@ from cairn.dispatcher.scheduler.loop import DispatcherLoop
 from cairn.server import db
 from cairn.server.app import app
 from cairn.server.models import ProjectDetail, ProjectSummary, Settings
+from cairn.dispatcher.workers.adapters import mock as mock_adapter
 
 
 class InProcessClient:
@@ -247,6 +249,20 @@ def _config(
             ],
         }
     )
+
+
+def test_mock_driver_uses_active_python_interpreter_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(mock_adapter, "os", os, raising=False)
+    monkeypatch.setattr(mock_adapter.os, "name", "nt")
+    worker = _config(
+        bootstrap=_phase("complete"),
+        reason=_phase("complete", zero_outcomes=["intent"]),
+        explore=_phase("fact"),
+    ).workers[0]
+    driver = mock_adapter.MockDriver()
+
+    assert driver.local_binary() == sys.executable
+    assert driver.build_execute(worker, "{}", None).argv[0] == sys.executable
 
 
 def _loop(config: DispatchConfig, client: InProcessClient, containers: LocalContainerManager) -> DispatcherLoop:
