@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -237,6 +238,38 @@ def _ensure_auth_credential_columns(conn: sqlite3.Connection) -> None:
         )
     if "deployment_slot" not in columns:
         conn.execute("ALTER TABLE auth_credentials ADD COLUMN deployment_slot TEXT")
+
+    # Before deployment ownership was recorded, bootstrap_auth_credentials used
+    # the canonical actor/scope metadata below. Only those unambiguous rows are
+    # adopted; operator credentials with similar scopes remain manual.
+    rows = conn.execute(
+        "SELECT id, actor_id, scopes, project_allowlist FROM auth_credentials "
+        "WHERE deployment_owned = 0 AND deployment_slot IS NULL"
+    ).fetchall()
+    for row in rows:
+        try:
+            scopes = json.loads(row["scopes"])
+            projects = json.loads(row["project_allowlist"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        slot = None
+        if (
+            row["actor_id"] == "dispatcher"
+            and scopes == ["dispatcher.auth.consume"]
+            and projects == ["*"]
+        ):
+            slot = "dispatcher"
+        elif (
+            row["actor_id"] == "helper"
+            and scopes == ["helper.event.submit", "helper.request.read"]
+            and projects == ["*"]
+        ):
+            slot = "helper"
+        if slot is not None:
+            conn.execute(
+                "UPDATE auth_credentials SET deployment_owned = 1, deployment_slot = ? WHERE id = ?",
+                (slot, row["id"]),
+            )
 
 
 def _expiry_for(created_at: str, ttl: int) -> str | None:

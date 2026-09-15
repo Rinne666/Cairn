@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 
 from cairn.server import db
+from cairn.server.services import bootstrap_auth_deployment
 
 
 def test_configure_adds_bootstrap_enabled_to_legacy_projects_table(tmp_path, monkeypatch) -> None:
@@ -135,3 +138,83 @@ def test_configure_adds_auth_control_plane_tables_and_backfills_legacy_requests(
         assert conn.execute(
             "SELECT COUNT(*) AS count FROM auth_lifecycle_events WHERE request_id = 'auth_001'"
         ).fetchone()["count"] == 2
+
+
+def test_configure_backfills_unambiguous_legacy_deployment_credentials(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "legacy-credentials.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE settings (intent_timeout INTEGER NOT NULL, reason_timeout INTEGER NOT NULL)")
+        conn.execute("INSERT INTO settings VALUES (15, 15)")
+        conn.execute(
+            """
+            CREATE TABLE projects (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("INSERT INTO projects VALUES ('proj_001', 'legacy', 'active', '2026-01-01T00:00:00Z')")
+        conn.execute(
+            """
+            CREATE TABLE auth_credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_digest TEXT NOT NULL UNIQUE,
+                actor_id TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                project_allowlist TEXT NOT NULL,
+                not_before TEXT NOT NULL,
+                expires_at TEXT,
+                replaced_by TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        rows = [
+            ("legacy-dispatcher", "dispatcher", ["dispatcher.auth.consume"], ["*"]),
+            ("legacy-helper", "helper", ["helper.event.submit", "helper.request.read"], ["*"]),
+            ("manual-same-shape", "operator", ["helper.event.submit", "helper.request.read"], ["*"]),
+        ]
+        for token, actor_id, scopes, projects in rows:
+            conn.execute(
+                """INSERT INTO auth_credentials
+                (token_digest, actor_id, scopes, project_allowlist, not_before, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    hashlib.sha256(token.encode()).hexdigest(),
+                    actor_id,
+                    json.dumps(scopes),
+                    json.dumps(projects),
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+
+    monkeypatch.setattr(db, "_db_path", None)
+    monkeypatch.delenv("CAIRN_AUTH_DEPLOYMENT_SNAPSHOT", raising=False)
+    monkeypatch.delenv("CAIRN_AUTH_DISPATCHER_TOKEN", raising=False)
+    monkeypatch.delenv("CAIRN_AUTH_HELPER_TOKEN", raising=False)
+    db.configure(path)
+
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT actor_id, deployment_owned, deployment_slot FROM auth_credentials ORDER BY actor_id"
+        ).fetchall()
+    assert [(row["actor_id"], row["deployment_owned"], row["deployment_slot"]) for row in rows] == [
+        ("dispatcher", 1, "dispatcher"),
+        ("helper", 1, "helper"),
+        ("operator", 0, None),
+    ]
+
+    with db.get_conn() as conn:
+        bootstrap_auth_deployment(
+            conn,
+            dispatcher_token="new-dispatcher",
+            allow_environment_fallback=False,
+        )
+        rows = conn.execute(
+            "SELECT token_digest, expires_at FROM auth_credentials"
+        ).fetchall()
+    expiry_by_token = {row["token_digest"]: row["expires_at"] for row in rows}
+    assert expiry_by_token[hashlib.sha256(b"legacy-dispatcher").hexdigest()] is not None
+    assert expiry_by_token[hashlib.sha256(b"legacy-helper").hexdigest()] is not None
+    assert expiry_by_token[hashlib.sha256(b"manual-same-shape").hexdigest()] is None
