@@ -92,10 +92,12 @@ def bootstrap_auth_credentials(
     helper_actor_id: str | None = None,
     helper_scopes: Iterable[str] | None = None,
     helper_project_allowlist: Iterable[str] | None = None,
+    allow_environment_fallback: bool = True,
 ) -> None:
     """Provision deployment credentials while keeping opaque tokens out of storage."""
-    helper_token = helper_token if helper_token is not None else os.getenv("CAIRN_AUTH_HELPER_TOKEN")
-    dispatcher_token = dispatcher_token if dispatcher_token is not None else os.getenv("CAIRN_AUTH_DISPATCHER_TOKEN")
+    if allow_environment_fallback:
+        helper_token = helper_token if helper_token is not None else os.getenv("CAIRN_AUTH_HELPER_TOKEN")
+        dispatcher_token = dispatcher_token if dispatcher_token is not None else os.getenv("CAIRN_AUTH_DISPATCHER_TOKEN")
     if helper_token:
         _upsert_deployment_credential(
             conn,
@@ -160,6 +162,7 @@ def bootstrap_auth_deployment(
         helper_actor_id=helper_actor_id,
         helper_scopes=helper_scopes,
         helper_project_allowlist=helper_projects,
+        allow_environment_fallback=allow_environment_fallback,
     )
     if target_configs is None and auth_config is not None:
         target_configs = {

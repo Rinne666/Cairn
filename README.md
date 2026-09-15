@@ -178,6 +178,16 @@ uv run --project cairn cairn dispatch --config dispatch.yaml
 uv run --project cairn cairn dispatch --config dispatch.yaml --startup-healthcheck-only
 ```
 
+### Authentication deployment prerequisite
+
+When `auth` is enabled, the Server operator must seed the Dispatcher credential before
+starting `DispatcherLoop`. Set `CAIRN_AUTH_DISPATCHER_TOKEN` only in the Server's
+deployment environment and start or restart the Server; its startup bootstrap stores
+only the token's SHA-256 digest. Then put the same opaque value in `server_token` in
+`dispatch.yaml` and start the Dispatcher. The internal deployment endpoint is
+authenticated by design, so a first call without that Server-side seed returns `401`;
+there is no public unauthenticated credential-creation endpoint.
+
 ### Local mode (no Docker)
 
 Instead of one container per project, workers can run directly on the dispatcher host, reusing the machine's already-configured `claude` / `codex` / `pi` CLIs — no Docker, and no API keys in the config.

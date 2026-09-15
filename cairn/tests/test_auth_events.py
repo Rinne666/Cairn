@@ -260,6 +260,83 @@ def test_internal_deployment_bootstrap_uses_request_snapshot_over_server_environ
     ]
 
 
+def test_internal_deployment_bootstrap_does_not_fall_back_to_helper_environment(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setenv("CAIRN_AUTH_HELPER_TOKEN", "environment-helper-secret")
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json={"dispatcher_token": "dispatcher-token"},
+        headers=_headers("dispatcher-token", proto="https"),
+    )
+
+    assert response.status_code == 204
+    with db.get_conn() as conn:
+        assert lookup_auth_credential(conn, "environment-helper-secret") is None
+
+
+def test_internal_deployment_bootstrap_does_not_fall_back_to_dispatcher_environment(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setenv("CAIRN_AUTH_DISPATCHER_TOKEN", "environment-dispatcher-secret")
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json={},
+        headers=_headers("dispatcher-token", proto="https"),
+    )
+
+    assert response.status_code == 204
+    with db.get_conn() as conn:
+        assert lookup_auth_credential(conn, "environment-dispatcher-secret") is None
+
+
+def test_internal_deployment_requires_server_seed_before_first_authenticated_call(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(db, "_db_path", None)
+    monkeypatch.delenv("CAIRN_AUTH_DISPATCHER_TOKEN", raising=False)
+    db.configure(tmp_path / "first-run.db")
+
+    with TestClient(app, base_url="https://testserver") as test_client:
+        denied = test_client.post(
+            "/internal/auth/deployment",
+            json={"dispatcher_token": "dispatcher-token"},
+            headers=_headers("dispatcher-token", proto="https"),
+        )
+        assert denied.status_code == 401
+
+        # The Server operator performs this deployment-only seed before starting
+        # DispatcherLoop; no unauthenticated API bootstrap is available.
+        monkeypatch.setenv("CAIRN_AUTH_DISPATCHER_TOKEN", "dispatcher-token")
+        with db.get_conn() as conn:
+            bootstrap_auth_deployment(conn)
+
+        accepted = test_client.post(
+            "/internal/auth/deployment",
+            json={"dispatcher_token": "dispatcher-token"},
+            headers=_headers("dispatcher-token", proto="https"),
+        )
+        assert accepted.status_code == 204
+
+
 def test_transport_guard_rejects_non_loopback_cleartext(client: TestClient) -> None:
     with TestClient(app, base_url="http://remote.example") as insecure:
         response = insecure.post("/auth-events", json=_event(), headers=_headers())

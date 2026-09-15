@@ -45,6 +45,10 @@ Graph effects are a transactional `auth_graph_outbox` record keyed by non-null `
 
 Bearer credentials are deployment configuration, never graph/projection data. Server stores only SHA-256 token digest, actor id, scopes, project allowlist, `not_before`, `expires_at`, and `replaced_by`. Rotation adds a bounded-overlap digest; revocation sets expiry to server-now. HTTPS is required except loopback. Every endpoint requires scope and project authorization.
 
+### First-run deployment prerequisite
+
+The internal deployment endpoint is intentionally authenticated and is not a credential-creation endpoint. Before `DispatcherLoop` can call `POST /internal/auth/deployment`, the Server operator must provision the Dispatcher token through the Server-only deployment environment or an equivalent Server startup bootstrap. Set `CAIRN_AUTH_DISPATCHER_TOKEN` for the Server process (or include the same value in its deployment snapshot), start or restart the Server, and verify that only the SHA-256 digest was persisted in `auth_credentials`. Configure the identical opaque value as the Dispatcher's `server_token` only after that seed exists. A first call without the Server-side seed must return `401`; adding an unauthenticated first-run route would violate the deployment boundary. The Server-side bootstrap is the only first-run path and must never be exposed as a public API or written to graph records.
+
 | Caller | Endpoint | Scope | Permission |
 |---|---|---|---|
 | Helper/CLI | `GET /projects/{project_id}/auth-requests/{request_id}/helper-view` | `helper.request.read` | id, auth_ref, configured login URL, status only |
