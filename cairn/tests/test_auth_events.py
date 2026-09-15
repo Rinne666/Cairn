@@ -164,6 +164,102 @@ def test_target_authority_snapshot_replaces_stale_targets_atomically(tmp_path, m
     assert [(row["auth_ref"], row["login_url"]) for row in rows] == [("fresh", "https://fresh.example/login")]
 
 
+def test_internal_deployment_bootstrap_requires_dispatcher_and_replaces_snapshot(client: TestClient) -> None:
+    payload = {
+        "dispatcher_token": "dispatcher-token",
+        "helper_token": "helper-token-new",
+        "helper_actor_id": "desktop-helper",
+        "helper_scopes": ["helper.event.submit", "helper.request.read"],
+        "helper_project_allowlist": ["proj_001"],
+        "targets": {"fresh": "https://fresh.example/login"},
+    }
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO auth_target_configs VALUES ('stale', 'https://stale.example/login')")
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+
+    assert client.post("/internal/auth/deployment", json=payload).status_code == 401
+    assert client.post("/internal/auth/deployment", json=payload, headers=_headers()).status_code == 403
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json=payload,
+        headers=_headers("dispatcher-token", proto="https"),
+    )
+    assert response.status_code == 204
+    with db.get_conn() as conn:
+        targets = conn.execute("SELECT auth_ref, login_url FROM auth_target_configs").fetchall()
+        credentials = conn.execute("SELECT token_digest, actor_id FROM auth_credentials ORDER BY actor_id").fetchall()
+    assert [(row["auth_ref"], row["login_url"]) for row in targets] == [("fresh", "https://fresh.example/login")]
+    assert ("dispatcher-token" not in str(credentials))
+    assert any(row["actor_id"] == "desktop-helper" for row in credentials)
+
+
+def test_internal_deployment_bootstrap_rejects_invalid_snapshot_without_partial_update(client: TestClient) -> None:
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO auth_target_configs VALUES ('stale', 'https://stale.example/login')")
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json={
+            "dispatcher_token": "dispatcher-token",
+            "targets": {
+                "fresh": "https://fresh.example/login",
+                "bad": "http://insecure.example/login",
+            },
+        },
+        headers=_headers("dispatcher-token", proto="https"),
+    )
+    assert response.status_code == 422
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT auth_ref, login_url FROM auth_target_configs").fetchall()
+    assert [(row["auth_ref"], row["login_url"]) for row in rows] == [
+        ("stale", "https://stale.example/login")
+    ]
+
+
+def test_internal_deployment_bootstrap_uses_request_snapshot_over_server_environment(client: TestClient, monkeypatch) -> None:
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+    monkeypatch.setenv(
+        "CAIRN_AUTH_DEPLOYMENT_SNAPSHOT",
+        '{"dispatcher_token":"wrong-token","targets":{"environment":"https://environment.example/login"}}',
+    )
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json={
+            "dispatcher_token": "dispatcher-token",
+            "targets": {"request": "https://request.example/login"},
+        },
+        headers=_headers("dispatcher-token", proto="https"),
+    )
+    assert response.status_code == 204
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT auth_ref, login_url FROM auth_target_configs").fetchall()
+    assert [(row["auth_ref"], row["login_url"]) for row in rows] == [
+        ("request", "https://request.example/login")
+    ]
+
+
 def test_transport_guard_rejects_non_loopback_cleartext(client: TestClient) -> None:
     with TestClient(app, base_url="http://remote.example") as insecure:
         response = insecure.post("/auth-events", json=_event(), headers=_headers())

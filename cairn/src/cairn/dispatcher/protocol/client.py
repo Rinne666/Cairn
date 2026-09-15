@@ -64,6 +64,14 @@ class CairnClient:
         response.raise_for_status()
         return Settings.model_validate(response.json())
 
+    def bootstrap_auth_deployment(self, snapshot: dict[str, Any]) -> ApiResult:
+        """Apply the Dispatcher-owned auth deployment snapshot on the Server."""
+        return self._request_json(
+            "POST",
+            "/internal/auth/deployment",
+            json=snapshot,
+        )
+
     def export_project(self, project_id: str) -> str:
         response = self._session().get(
             self._url(f"/projects/{project_id}/export"),

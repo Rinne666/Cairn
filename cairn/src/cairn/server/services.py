@@ -120,6 +120,11 @@ def bootstrap_auth_deployment(
     auth_config: object | None = None,
     dispatcher_token: str | None = None,
     target_configs: dict[str, str] | None = None,
+    helper_token: str | None = None,
+    helper_actor_id: str | None = None,
+    helper_scopes: Iterable[str] | None = None,
+    helper_project_allowlist: Iterable[str] | None = None,
+    allow_environment_fallback: bool = True,
 ) -> None:
     """Apply one deployment's AuthConfig snapshot atomically.
 
@@ -128,11 +133,12 @@ def bootstrap_auth_deployment(
     (or the concrete config object in local mode), while never persisting raw tokens.
     """
     helper_token_env = getattr(auth_config, "helper_token_env", "CAIRN_AUTH_HELPER_TOKEN")
-    helper_actor_id = getattr(auth_config, "helper_actor_id", "helper")
-    helper_scopes = getattr(auth_config, "helper_scopes", None)
-    helper_projects = getattr(auth_config, "helper_project_allowlist", None)
-    helper_token = os.getenv(helper_token_env)
-    if auth_config is None:
+    helper_actor_id = helper_actor_id if helper_actor_id is not None else getattr(auth_config, "helper_actor_id", "helper")
+    helper_scopes = helper_scopes if helper_scopes is not None else getattr(auth_config, "helper_scopes", None)
+    helper_projects = helper_project_allowlist if helper_project_allowlist is not None else getattr(auth_config, "helper_project_allowlist", None)
+    if helper_token is None and allow_environment_fallback:
+        helper_token = os.getenv(helper_token_env)
+    if auth_config is None and allow_environment_fallback:
         snapshot_raw = os.getenv("CAIRN_AUTH_DEPLOYMENT_SNAPSHOT")
         snapshot: dict = {}
         if snapshot_raw:

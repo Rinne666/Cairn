@@ -64,6 +64,7 @@ class DispatcherLoop:
         self.project_cursor = 0
         self._settings_checked = False
         self._startup_healthchecks_checked = False
+        self._auth_deployment_checked = False
 
     def close(self) -> None:
         if self.futures:
@@ -79,6 +80,7 @@ class DispatcherLoop:
 
     def run(self, once: bool = False) -> None:
         try:
+            self._bootstrap_auth_deployment()
             self.run_startup_healthchecks()
             while True:
                 try:
@@ -108,6 +110,24 @@ class DispatcherLoop:
                 time.sleep(self.config.runtime.interval)
         finally:
             self.close()
+
+    def _bootstrap_auth_deployment(self) -> None:
+        """Synchronize auth deployment state before the dispatcher consumes work."""
+        if getattr(self, "_auth_deployment_checked", False):
+            return
+        snapshot = self.config.auth_deployment_snapshot()
+        if not snapshot.get("dispatcher_token"):
+            if self.config.auth is None:
+                self._auth_deployment_checked = True
+                return
+            raise RuntimeError("auth deployment requires dispatch config server_token")
+
+        result = self.client.bootstrap_auth_deployment(snapshot)
+        if not result.ok:
+            raise RuntimeError(
+                f"auth deployment bootstrap failed with server status {result.status_code}"
+            )
+        self._auth_deployment_checked = True
 
     def run_startup_healthchecks_only(self) -> None:
         try:

@@ -331,3 +331,19 @@ def test_startup_only_worker_healthcheck_runs_automatic_startup_check() -> None:
     loop.run_startup_healthchecks()
 
     assert calls == [False]
+
+
+def test_dispatcher_bootstraps_auth_deployment_before_startup_work() -> None:
+    loop = _loop()
+    loop.config = make_config().model_copy(update={"server_token": "dispatcher-token"})
+    calls: list[dict] = []
+
+    class Client:
+        def bootstrap_auth_deployment(self, snapshot: dict) -> object:
+            calls.append(snapshot)
+            return type("Result", (), {"ok": True, "status_code": 204, "text": ""})()
+
+    loop.client = Client()
+    loop._bootstrap_auth_deployment()
+
+    assert calls == [{"dispatcher_token": "dispatcher-token"}]

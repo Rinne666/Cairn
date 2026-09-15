@@ -422,3 +422,56 @@ class AuthCredential(BaseModel):
     expires_at: str | None = None
     replaced_by: str | None = None
     created_at: str
+
+
+class AuthDeploymentSnapshot(BaseModel):
+    """Dispatcher-owned deployment material used only by the internal bootstrap RPC."""
+
+    model_config = {"extra": "forbid"}
+
+    dispatcher_token: str | None = None
+    helper_token: str | None = None
+    helper_actor_id: str = "helper"
+    helper_scopes: list[str] = Field(
+        default_factory=lambda: ["helper.event.submit", "helper.request.read"]
+    )
+    helper_project_allowlist: list[str] = Field(default_factory=list)
+    targets: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("dispatcher_token", "helper_token")
+    @classmethod
+    def validate_optional_secret(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value if value.strip() else None
+
+    @field_validator("helper_actor_id")
+    @classmethod
+    def validate_actor_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("helper_actor_id must not be empty")
+        return value
+
+    @field_validator("helper_scopes", "helper_project_allowlist")
+    @classmethod
+    def validate_string_lists(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        if any(not item for item in cleaned):
+            raise ValueError("values must not be empty")
+        return sorted(set(cleaned))
+
+    @field_validator("targets")
+    @classmethod
+    def validate_target_urls(cls, value: dict[str, str]) -> dict[str, str]:
+        from urllib.parse import urlparse
+
+        cleaned: dict[str, str] = {}
+        for auth_ref, login_url in value.items():
+            ref = auth_ref.strip()
+            url = login_url.strip()
+            parsed = urlparse(url)
+            if not ref or parsed.scheme != "https" or not parsed.netloc:
+                raise ValueError("targets must contain non-empty auth refs and HTTPS login URLs")
+            cleaned[ref] = url
+        return cleaned
