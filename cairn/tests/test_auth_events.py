@@ -13,6 +13,7 @@ from cairn.server import db
 from cairn.server.app import app
 from cairn.server.models import CreateAuthEvent
 from cairn.server.services import (
+    bootstrap_auth_credentials,
     bootstrap_auth_deployment,
     lookup_auth_credential,
     provision_auth_credential,
@@ -138,6 +139,34 @@ def test_deployment_bootstrap_hashes_helper_and_dispatcher_tokens_without_plaint
         assert all("deployment-secret" not in row["token_digest"] for row in rows)
         helper = next(row for row in rows if row["actor_id"] == "desktop-helper")
         assert helper["project_allowlist"] == '["proj_001", "proj_002"]'
+
+
+def test_internal_credential_bootstrap_ignores_environment_metadata(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(tmp_path / "bootstrap-metadata.db")
+    monkeypatch.setenv("CAIRN_AUTH_DISPATCHER_ACTOR_ID", "environment-dispatcher")
+    monkeypatch.setenv("CAIRN_AUTH_DISPATCHER_SCOPES", "*")
+    monkeypatch.setenv("CAIRN_AUTH_DISPATCHER_PROJECTS", "*")
+    monkeypatch.setenv("CAIRN_AUTH_HELPER_ACTOR_ID", "environment-helper")
+    monkeypatch.setenv("CAIRN_AUTH_HELPER_SCOPES", "*")
+    monkeypatch.setenv("CAIRN_AUTH_HELPER_PROJECTS", "*")
+
+    with db.get_conn() as conn:
+        bootstrap_auth_credentials(
+            conn,
+            dispatcher_token="dispatcher-snapshot",
+            helper_token="helper-snapshot",
+            allow_environment_fallback=False,
+        )
+        rows = {
+            row["actor_id"]: row
+            for row in conn.execute("SELECT * FROM auth_credentials ORDER BY actor_id")
+        }
+
+    assert rows["dispatcher"]["scopes"] == '["dispatcher.auth.consume"]'
+    assert rows["dispatcher"]["project_allowlist"] == '["*"]'
+    assert rows["helper"]["scopes"] == '["helper.event.submit", "helper.request.read"]'
+    assert rows["helper"]["project_allowlist"] == '["*"]'
 
 
 def test_helper_view_uses_configured_target_authority(tmp_path, monkeypatch) -> None:

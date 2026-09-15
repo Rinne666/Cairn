@@ -99,20 +99,54 @@ def bootstrap_auth_credentials(
         helper_token = helper_token if helper_token is not None else os.getenv("CAIRN_AUTH_HELPER_TOKEN")
         dispatcher_token = dispatcher_token if dispatcher_token is not None else os.getenv("CAIRN_AUTH_DISPATCHER_TOKEN")
     if helper_token:
+        helper_actor = helper_actor_id or (
+            os.getenv("CAIRN_AUTH_HELPER_ACTOR_ID", "helper")
+            if allow_environment_fallback
+            else "helper"
+        )
+        helper_scope_values = (
+            helper_scopes
+            if helper_scopes is not None
+            else _csv_env("CAIRN_AUTH_HELPER_SCOPES", "helper.event.submit,helper.request.read")
+            if allow_environment_fallback
+            else ["helper.event.submit", "helper.request.read"]
+        )
+        helper_project_values = (
+            helper_project_allowlist
+            if helper_project_allowlist is not None
+            else _csv_env("CAIRN_AUTH_HELPER_PROJECTS", "*")
+            if allow_environment_fallback
+            else ["*"]
+        )
         _upsert_deployment_credential(
             conn,
             helper_token,
-            actor_id=helper_actor_id or os.getenv("CAIRN_AUTH_HELPER_ACTOR_ID", "helper"),
-            scopes=helper_scopes if helper_scopes is not None else _csv_env("CAIRN_AUTH_HELPER_SCOPES", "helper.event.submit,helper.request.read"),
-            projects=helper_project_allowlist if helper_project_allowlist is not None else _csv_env("CAIRN_AUTH_HELPER_PROJECTS", "*"),
+            actor_id=helper_actor,
+            scopes=helper_scope_values,
+            projects=helper_project_values,
         )
     if dispatcher_token:
+        dispatcher_actor = (
+            os.getenv("CAIRN_AUTH_DISPATCHER_ACTOR_ID", "dispatcher")
+            if allow_environment_fallback
+            else "dispatcher"
+        )
+        dispatcher_scope_values = (
+            _csv_env("CAIRN_AUTH_DISPATCHER_SCOPES", "dispatcher.auth.consume")
+            if allow_environment_fallback
+            else ["dispatcher.auth.consume"]
+        )
+        dispatcher_project_values = (
+            _csv_env("CAIRN_AUTH_DISPATCHER_PROJECTS", "*")
+            if allow_environment_fallback
+            else ["*"]
+        )
         _upsert_deployment_credential(
             conn,
             dispatcher_token,
-            actor_id=os.getenv("CAIRN_AUTH_DISPATCHER_ACTOR_ID", "dispatcher"),
-            scopes=_csv_env("CAIRN_AUTH_DISPATCHER_SCOPES", "dispatcher.auth.consume"),
-            projects=_csv_env("CAIRN_AUTH_DISPATCHER_PROJECTS", "*"),
+            actor_id=dispatcher_actor,
+            scopes=dispatcher_scope_values,
+            projects=dispatcher_project_values,
         )
 
 
