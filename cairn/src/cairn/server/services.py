@@ -8,12 +8,22 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from datetime import timedelta
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
+from pydantic import ValidationError
 
-from cairn.server.models import AuthCredential, AuthEvent, Intent, ProjectMeta, ProjectReason
+from cairn.server.models import (
+    AuthCredential,
+    AuthDeploymentSnapshot,
+    AuthEvent,
+    Intent,
+    ProjectMeta,
+    ProjectReason,
+)
+
+DEPLOYMENT_CREDENTIAL_OVERLAP_SECONDS = 300
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -98,6 +108,8 @@ def bootstrap_auth_credentials(
     if allow_environment_fallback:
         helper_token = helper_token if helper_token is not None else os.getenv("CAIRN_AUTH_HELPER_TOKEN")
         dispatcher_token = dispatcher_token if dispatcher_token is not None else os.getenv("CAIRN_AUTH_DISPATCHER_TOKEN")
+    if helper_token and dispatcher_token and helper_token.strip() == dispatcher_token.strip():
+        raise ValueError("dispatcher_token and helper_token must be different")
     if helper_token:
         helper_actor = helper_actor_id or (
             os.getenv("CAIRN_AUTH_HELPER_ACTOR_ID", "helper")
@@ -124,6 +136,7 @@ def bootstrap_auth_credentials(
             actor_id=helper_actor,
             scopes=helper_scope_values,
             projects=helper_project_values,
+            deployment_slot="helper",
         )
     if dispatcher_token:
         dispatcher_actor = (
@@ -147,6 +160,7 @@ def bootstrap_auth_credentials(
             actor_id=dispatcher_actor,
             scopes=dispatcher_scope_values,
             projects=dispatcher_project_values,
+            deployment_slot="dispatcher",
         )
 
 
@@ -168,43 +182,100 @@ def bootstrap_auth_deployment(
     snapshot through the deployment mechanism; this function accepts that snapshot
     (or the concrete config object in local mode), while never persisting raw tokens.
     """
+    snapshot_present = False
+    apply_targets = target_configs is not None
     helper_token_env = getattr(auth_config, "helper_token_env", "CAIRN_AUTH_HELPER_TOKEN")
-    helper_actor_id = helper_actor_id if helper_actor_id is not None else getattr(auth_config, "helper_actor_id", "helper")
-    helper_scopes = helper_scopes if helper_scopes is not None else getattr(auth_config, "helper_scopes", None)
-    helper_projects = helper_project_allowlist if helper_project_allowlist is not None else getattr(auth_config, "helper_project_allowlist", None)
-    if helper_token is None and allow_environment_fallback:
-        helper_token = os.getenv(helper_token_env)
+
     if auth_config is None and allow_environment_fallback:
         snapshot_raw = os.getenv("CAIRN_AUTH_DEPLOYMENT_SNAPSHOT")
-        snapshot: dict = {}
-        if snapshot_raw:
+        if snapshot_raw is not None:
+            snapshot_present = True
             try:
-                parsed = json.loads(snapshot_raw)
-                snapshot = parsed if isinstance(parsed, dict) else {}
-            except json.JSONDecodeError:
-                snapshot = {}
-        helper_token = snapshot.get("helper_token", helper_token)
-        dispatcher_token = snapshot.get("dispatcher_token", dispatcher_token)
-        helper_actor_id = snapshot.get("helper_actor_id", helper_actor_id)
-        helper_scopes = snapshot.get("helper_scopes", helper_scopes)
-        helper_projects = snapshot.get("helper_project_allowlist", helper_projects)
-        target_configs = snapshot.get("targets", target_configs)
+                parsed: Any = json.loads(snapshot_raw)
+                snapshot = AuthDeploymentSnapshot.model_validate(parsed)
+            except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+                raise ValueError("invalid auth deployment snapshot") from exc
+            dispatcher_token = snapshot.dispatcher_token
+            helper_token = snapshot.helper_token
+            helper_actor_id = snapshot.helper_actor_id
+            helper_scopes = snapshot.helper_scopes
+            helper_projects = snapshot.helper_project_allowlist
+            target_configs = snapshot.targets
+            apply_targets = True
+        else:
+            helper_token = helper_token if helper_token is not None else os.getenv(helper_token_env)
+            dispatcher_token = (
+                dispatcher_token
+                if dispatcher_token is not None
+                else os.getenv("CAIRN_AUTH_DISPATCHER_TOKEN")
+            )
+            helper_actor_id = helper_actor_id or os.getenv("CAIRN_AUTH_HELPER_ACTOR_ID", "helper")
+            helper_scopes = helper_scopes if helper_scopes is not None else _csv_env(
+                "CAIRN_AUTH_HELPER_SCOPES", "helper.event.submit,helper.request.read"
+            )
+            helper_projects = (
+                helper_project_allowlist
+                if helper_project_allowlist is not None
+                else _csv_env("CAIRN_AUTH_HELPER_PROJECTS", "*")
+            )
+    else:
+        helper_token = helper_token if helper_token is not None else (
+            os.getenv(helper_token_env) if allow_environment_fallback else None
+        )
+        helper_actor_id = helper_actor_id if helper_actor_id is not None else getattr(
+            auth_config, "helper_actor_id", "helper"
+        )
+        helper_scopes = helper_scopes if helper_scopes is not None else getattr(
+            auth_config, "helper_scopes", None
+        )
+        helper_projects = (
+            helper_project_allowlist
+            if helper_project_allowlist is not None
+            else getattr(auth_config, "helper_project_allowlist", None)
+        )
+        if target_configs is None and auth_config is not None:
+            target_configs = {
+                target.name: target.login_url
+                for target in getattr(auth_config, "targets", [])
+            }
+            apply_targets = True
+
+    # Validate every field before touching SQLite. This matters for callers that
+    # invoke this primitive outside ``db.get_conn``'s transaction wrapper.
+    snapshot = AuthDeploymentSnapshot.model_validate(
+        {
+            "dispatcher_token": dispatcher_token,
+            "helper_token": helper_token,
+            "helper_actor_id": helper_actor_id or "helper",
+            "helper_scopes": list(helper_scopes or ["helper.event.submit", "helper.request.read"]),
+            "helper_project_allowlist": list(helper_projects or []),
+            "targets": target_configs if target_configs is not None else {},
+        }
+    )
+    if (
+        not snapshot_present
+        and auth_config is None
+        and dispatcher_token is None
+        and helper_token is None
+        and not apply_targets
+    ):
+        # A plain Server restart without deployment material must not revoke the
+        # last known deployment authority. Explicit snapshots still reconcile.
+        return
+
+    _validate_deployment_collisions(conn, snapshot)
+    _reconcile_deployment_credentials(conn, snapshot)
     bootstrap_auth_credentials(
         conn,
-        helper_token=helper_token,
-        dispatcher_token=dispatcher_token,
-        helper_actor_id=helper_actor_id,
-        helper_scopes=helper_scopes,
-        helper_project_allowlist=helper_projects,
-        allow_environment_fallback=allow_environment_fallback,
+        helper_token=snapshot.helper_token,
+        dispatcher_token=snapshot.dispatcher_token,
+        helper_actor_id=snapshot.helper_actor_id,
+        helper_scopes=snapshot.helper_scopes,
+        helper_project_allowlist=snapshot.helper_project_allowlist,
+        allow_environment_fallback=False,
     )
-    if target_configs is None and auth_config is not None:
-        target_configs = {
-            target.name: target.login_url
-            for target in getattr(auth_config, "targets", [])
-        }
-    if target_configs is not None:
-        bootstrap_auth_target_configs(conn, target_configs)
+    if apply_targets:
+        bootstrap_auth_target_configs(conn, snapshot.targets)
 def _csv_env(name: str, default: str) -> list[str]:
     return sorted({item.strip() for item in os.getenv(name, default).split(",") if item.strip()})
 
@@ -216,22 +287,136 @@ def _upsert_deployment_credential(
     actor_id: str,
     scopes: Iterable[str],
     projects: Iterable[str],
+    deployment_slot: str,
 ) -> None:
+    actor_id = actor_id.strip()
+    scope_values = sorted({str(value).strip() for value in scopes if str(value).strip()})
+    project_values = sorted({str(value).strip() for value in projects if str(value).strip()})
+    if not actor_id or not scope_values or deployment_slot not in {"dispatcher", "helper"}:
+        raise ValueError("invalid deployment credential metadata")
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    encoded_scopes = json.dumps(sorted({value.strip() for value in scopes if value.strip()}))
-    encoded_projects = json.dumps(sorted({value.strip() for value in projects if value.strip()}))
+    encoded_scopes = json.dumps(scope_values)
+    encoded_projects = json.dumps(project_values)
     now = utcnow()
-    existing = conn.execute("SELECT id FROM auth_credentials WHERE token_digest = ?", (digest,)).fetchone()
+    existing = conn.execute(
+        "SELECT * FROM auth_credentials WHERE token_digest = ?", (digest,)
+    ).fetchone()
     if existing is None:
         conn.execute(
-            "INSERT INTO auth_credentials (token_digest, actor_id, scopes, project_allowlist, not_before, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (digest, actor_id, encoded_scopes, encoded_projects, now, now),
+            """
+            INSERT INTO auth_credentials
+                (token_digest, actor_id, scopes, project_allowlist, not_before, created_at,
+                 deployment_owned, deployment_slot)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (digest, actor_id, encoded_scopes, encoded_projects, now, now, deployment_slot),
         )
     else:
+        existing_scopes = json.loads(existing["scopes"])
+        existing_projects = json.loads(existing["project_allowlist"])
+        if (
+            existing["actor_id"] != actor_id
+            or existing_scopes != scope_values
+            or existing_projects != project_values
+        ):
+            raise ValueError("deployment credential digest collision")
         conn.execute(
-            "UPDATE auth_credentials SET actor_id = ?, scopes = ?, project_allowlist = ? WHERE id = ?",
-            (actor_id, encoded_scopes, encoded_projects, existing["id"]),
+            """
+            UPDATE auth_credentials
+               SET deployment_owned = 1, deployment_slot = ?, expires_at = NULL
+             WHERE id = ?
+            """,
+            (deployment_slot, existing["id"]),
         )
+
+
+def _validate_deployment_collisions(
+    conn: sqlite3.Connection, snapshot: AuthDeploymentSnapshot
+) -> None:
+    desired = (
+        ("dispatcher", snapshot.dispatcher_token, "dispatcher", ["dispatcher.auth.consume"], ["*"]),
+        (
+            "helper",
+            snapshot.helper_token,
+            snapshot.helper_actor_id,
+            snapshot.helper_scopes,
+            snapshot.helper_project_allowlist,
+        ),
+    )
+    seen: set[str] = set()
+    for slot, token, actor_id, scopes, projects in desired:
+        if token is None:
+            continue
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if digest in seen:
+            raise ValueError("dispatcher and helper tokens must be different")
+        seen.add(digest)
+        row = conn.execute(
+            "SELECT actor_id, scopes, project_allowlist FROM auth_credentials WHERE token_digest = ?",
+            (digest,),
+        ).fetchone()
+        if row is None:
+            continue
+        if (
+            row["actor_id"] != actor_id
+            or json.loads(row["scopes"]) != sorted(set(scopes))
+            or json.loads(row["project_allowlist"]) != sorted(set(projects))
+        ):
+            raise ValueError(f"deployment credential digest collision for {slot}")
+
+
+def _reconcile_deployment_credentials(
+    conn: sqlite3.Connection, snapshot: AuthDeploymentSnapshot
+) -> None:
+    desired_digests = {
+        hashlib.sha256(token.encode("utf-8")).hexdigest()
+        for token in (snapshot.dispatcher_token, snapshot.helper_token)
+        if token is not None
+    }
+    desired_slots = {
+        slot
+        for slot, token in (("dispatcher", snapshot.dispatcher_token), ("helper", snapshot.helper_token))
+        if token is not None
+    }
+    now = datetime.now(timezone.utc)
+    overlap = (now + timedelta(seconds=DEPLOYMENT_CREDENTIAL_OVERLAP_SECONDS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    rows = conn.execute(
+        "SELECT id, token_digest, actor_id, scopes, expires_at, deployment_slot FROM auth_credentials WHERE deployment_owned = 1"
+    ).fetchall()
+    for row in rows:
+        if row["token_digest"] in desired_digests:
+            continue
+        # A replaced current/previous credential is retained only for the short,
+        # fixed overlap. Helper credentials omitted from a snapshot are revoked
+        # immediately; the Dispatcher seed gets the same bounded grace window so
+        # an in-flight deployment call cannot strand the control plane.
+        expires_at = (
+            _bounded_expiry(row["expires_at"], overlap)
+            if row["deployment_slot"] in desired_slots or row["deployment_slot"] == "dispatcher"
+            else utcnow()
+        )
+        conn.execute(
+            "UPDATE auth_credentials SET expires_at = ? WHERE id = ?",
+            (expires_at, row["id"]),
+        )
+
+
+def _bounded_expiry(existing: str | None, proposed: str) -> str:
+    """Never extend an already shorter credential validity window."""
+    if not existing:
+        return proposed
+    try:
+        existing_dt = datetime.fromisoformat(existing.replace("Z", "+00:00"))
+        proposed_dt = datetime.fromisoformat(proposed.replace("Z", "+00:00"))
+    except ValueError:
+        return existing
+    if existing_dt.tzinfo is None:
+        existing_dt = existing_dt.replace(tzinfo=timezone.utc)
+    if proposed_dt.tzinfo is None:
+        proposed_dt = proposed_dt.replace(tzinfo=timezone.utc)
+    return existing if existing_dt <= proposed_dt else proposed
 
 
 def bootstrap_auth_target_configs(conn: sqlite3.Connection, values: dict[str, str] | None = None) -> None:

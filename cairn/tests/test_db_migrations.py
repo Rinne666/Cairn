@@ -112,6 +112,10 @@ def test_configure_adds_auth_control_plane_tables_and_backfills_legacy_requests(
             ).fetchone()
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(auth_requests)")}
         assert {"helper_actor_id", "expires_at", "expiry_generation"} <= columns
+        credential_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(auth_credentials)")
+        }
+        assert {"deployment_owned", "deployment_slot"} <= credential_columns
         lifecycle = conn.execute(
             "SELECT event_id, kind, outcome_code FROM auth_lifecycle_events WHERE request_id = 'auth_001' ORDER BY sequence"
         ).fetchall()

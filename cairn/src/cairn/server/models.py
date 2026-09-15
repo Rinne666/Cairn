@@ -443,7 +443,8 @@ class AuthDeploymentSnapshot(BaseModel):
     def validate_optional_secret(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return value if value.strip() else None
+        value = value.strip()
+        return value if value else None
 
     @field_validator("helper_actor_id")
     @classmethod
@@ -461,6 +462,14 @@ class AuthDeploymentSnapshot(BaseModel):
             raise ValueError("values must not be empty")
         return sorted(set(cleaned))
 
+    @model_validator(mode="after")
+    def validate_distinct_credentials(self) -> "AuthDeploymentSnapshot":
+        if self.dispatcher_token is not None and self.dispatcher_token == self.helper_token:
+            raise ValueError("dispatcher_token and helper_token must be different")
+        if self.helper_token is not None and not self.helper_scopes:
+            raise ValueError("helper_scopes must not be empty when helper_token is set")
+        return self
+
     @field_validator("targets")
     @classmethod
     def validate_target_urls(cls, value: dict[str, str]) -> dict[str, str]:
@@ -473,5 +482,7 @@ class AuthDeploymentSnapshot(BaseModel):
             parsed = urlparse(url)
             if not ref or parsed.scheme != "https" or not parsed.netloc:
                 raise ValueError("targets must contain non-empty auth refs and HTTPS login URLs")
+            if ref in cleaned:
+                raise ValueError("targets must not contain duplicate auth refs")
             cleaned[ref] = url
         return cleaned

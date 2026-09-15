@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -227,6 +228,180 @@ def test_internal_deployment_bootstrap_requires_dispatcher_and_replaces_snapshot
     assert [(row["auth_ref"], row["login_url"]) for row in targets] == [("fresh", "https://fresh.example/login")]
     assert ("dispatcher-token" not in str(credentials))
     assert any(row["actor_id"] == "desktop-helper" for row in credentials)
+
+
+def test_internal_deployment_rejects_equal_helper_and_dispatcher_tokens_without_mutation(
+    client: TestClient,
+) -> None:
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+        conn.execute("INSERT INTO auth_target_configs VALUES ('stale', 'https://stale.example/login')")
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json={
+            "dispatcher_token": "dispatcher-token",
+            "helper_token": "dispatcher-token",
+            "targets": {"fresh": "https://fresh.example/login"},
+        },
+        headers=_headers("dispatcher-token", proto="https"),
+    )
+
+    assert response.status_code == 422
+    with db.get_conn() as conn:
+        # The fixture's helper credential is unrelated and must remain untouched.
+        assert conn.execute("SELECT COUNT(*) FROM auth_credentials").fetchone()[0] == 2
+        rows = conn.execute("SELECT auth_ref FROM auth_target_configs").fetchall()
+    assert [row["auth_ref"] for row in rows] == ["stale"]
+
+
+def test_internal_deployment_rejects_digest_collision_without_changing_existing_authority(
+    client: TestClient,
+) -> None:
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+        provision_auth_credential(
+            conn,
+            "collision-token",
+            actor_id="operator",
+            scopes={"ui.auth.read"},
+            project_allowlist={"proj_001"},
+        )
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json={
+            "dispatcher_token": "dispatcher-token",
+            "helper_token": "collision-token",
+            "helper_actor_id": "desktop-helper",
+            "helper_scopes": ["helper.event.submit"],
+            "helper_project_allowlist": ["*"],
+        },
+        headers=_headers("dispatcher-token", proto="https"),
+    )
+
+    assert response.status_code == 422
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT actor_id, scopes, project_allowlist FROM auth_credentials WHERE token_digest = ?",
+            (hashlib.sha256(b"collision-token").hexdigest(),),
+        ).fetchone()
+    assert row["actor_id"] == "operator"
+    assert row["scopes"] == '["ui.auth.read"]'
+    assert row["project_allowlist"] == '["proj_001"]'
+
+
+def test_deployment_snapshot_reconciles_omitted_credentials_and_preserves_manual_credentials(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(tmp_path / "deployment-reconcile.db")
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            "manual-token",
+            actor_id="operator",
+            scopes={"ui.auth.read"},
+            project_allowlist={"*"},
+        )
+        bootstrap_auth_deployment(
+            conn,
+            dispatcher_token="dispatcher-token",
+            helper_token="helper-token",
+            allow_environment_fallback=False,
+        )
+        bootstrap_auth_deployment(
+            conn,
+            dispatcher_token="dispatcher-token",
+            allow_environment_fallback=False,
+        )
+        helper = lookup_auth_credential(conn, "helper-token")
+        manual = lookup_auth_credential(conn, "manual-token")
+
+    assert helper is None
+    assert manual is not None
+
+
+def test_deployment_credential_rotation_has_bounded_current_previous_overlap(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(tmp_path / "deployment-rotation.db")
+    with db.get_conn() as conn:
+        bootstrap_auth_deployment(
+            conn,
+            dispatcher_token="dispatcher-old",
+            helper_token="helper-old",
+            allow_environment_fallback=False,
+        )
+        bootstrap_auth_deployment(
+            conn,
+            dispatcher_token="dispatcher-new",
+            helper_token="helper-new",
+            allow_environment_fallback=False,
+        )
+        assert lookup_auth_credential(conn, "dispatcher-old") is not None
+        assert lookup_auth_credential(conn, "helper-old") is not None
+        assert lookup_auth_credential(conn, "dispatcher-new") is not None
+        assert lookup_auth_credential(conn, "helper-new") is not None
+
+        old_dispatcher = lookup_auth_credential(conn, "dispatcher-old")
+        old_helper = lookup_auth_credential(conn, "helper-old")
+        assert old_dispatcher is not None and old_helper is not None
+        assert old_dispatcher.credential_id != old_helper.credential_id
+        rows = conn.execute(
+            "SELECT token_digest, expires_at FROM auth_credentials WHERE token_digest IN (?, ?)",
+            (
+                hashlib.sha256(b"dispatcher-old").hexdigest(),
+                hashlib.sha256(b"helper-old").hexdigest(),
+            ),
+        ).fetchall()
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            expiry = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+            assert now < expiry <= now + timedelta(seconds=300)
+
+
+def test_malformed_environment_snapshot_fails_before_mutating_authority(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(tmp_path / "malformed-snapshot.db")
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO auth_target_configs VALUES ('stale', 'https://stale.example/login')")
+        provision_auth_credential(
+            conn,
+            "dispatcher-token",
+            actor_id="dispatcher",
+            scopes={"dispatcher.auth.consume"},
+            project_allowlist={"*"},
+        )
+
+    monkeypatch.setenv(
+        "CAIRN_AUTH_DEPLOYMENT_SNAPSHOT",
+        '{"dispatcher_token":"dispatcher-token","helper_scopes":["valid", 7],'
+        '"targets":{"fresh":"https://fresh.example/login","bad":"http://bad.example/login"}}',
+    )
+    with db.get_conn() as conn:
+        with pytest.raises(ValueError):
+            bootstrap_auth_deployment(conn)
+
+    with db.get_conn() as conn:
+        targets = conn.execute("SELECT auth_ref, login_url FROM auth_target_configs").fetchall()
+        assert lookup_auth_credential(conn, "dispatcher-token") is not None
+    assert [(row["auth_ref"], row["login_url"]) for row in targets] == [
+        ("stale", "https://stale.example/login")
+    ]
 
 
 @pytest.mark.parametrize(

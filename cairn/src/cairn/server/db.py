@@ -147,7 +147,9 @@ CREATE TABLE IF NOT EXISTS auth_credentials (
     not_before TEXT NOT NULL,
     expires_at TEXT,
     replaced_by TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    deployment_owned INTEGER NOT NULL DEFAULT 0,
+    deployment_slot TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_credentials_actor ON auth_credentials (actor_id);
@@ -170,6 +172,7 @@ def configure(path: Path) -> None:
         _ensure_project_columns(conn)
         _ensure_settings_columns(conn)
         _ensure_auth_request_columns(conn)
+        _ensure_auth_credential_columns(conn)
         _ensure_auth_schema(conn)
         from cairn.server.services import bootstrap_auth_deployment
 
@@ -223,6 +226,17 @@ def _ensure_auth_request_columns(conn: sqlite3.Connection) -> None:
             "UPDATE auth_requests SET expires_at = ? WHERE id = ?",
             (expires_at, row["id"]),
         )
+
+
+def _ensure_auth_credential_columns(conn: sqlite3.Connection) -> None:
+    """Add deployment ownership metadata to pre-existing credential tables."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(auth_credentials)")}
+    if "deployment_owned" not in columns:
+        conn.execute(
+            "ALTER TABLE auth_credentials ADD COLUMN deployment_owned INTEGER NOT NULL DEFAULT 0"
+        )
+    if "deployment_slot" not in columns:
+        conn.execute("ALTER TABLE auth_credentials ADD COLUMN deployment_slot TEXT")
 
 
 def _expiry_for(created_at: str, ttl: int) -> str | None:
