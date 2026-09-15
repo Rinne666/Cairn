@@ -20,7 +20,7 @@ The accepted event JSON is exactly `{project_id, request_id, auth_ref, kind, ide
 
 `auth_commands` has the same queue, lease and idempotency columns. Its `kind` is `cancel|reauthenticate`; it has exactly one selector: `request_id` for cancel, or `auth_ref` for reauthenticate. Both/neither is 422. Success returns only `{command_id, state: "queued"}`.
 
-`auth_lifecycle_events` is append-only: `request_id`, `event_id` (nullable only for `created`), `sequence`, `kind`, `recorded_at`, enum-only `outcome_code`. Its canonical replay guard is unique `(request_id, event_id, kind)`. TTL has a generated `event_id` `ttl:<request_id>:<expiry_generation>`, never a Helper event.
+`auth_lifecycle_events` is append-only: `request_id`, non-null `event_id`, `sequence`, `kind`, `recorded_at`, enum-only `outcome_code`. Its canonical replay guard is unique `(request_id, event_id, kind)`. Request creation uses `create:<request_id>` (and migration backfill `backfill:create:<request_id>`); TTL uses `ttl:<request_id>:<expiry_generation>`. Thus SQLite NULL semantics cannot admit duplicate lifecycle records.
 
 ## Consumption, transitions, and expiry
 
@@ -30,14 +30,16 @@ In a `BEGIN IMMEDIATE` transaction Dispatcher selects the oldest eligible queued
 |---|---|---|
 | `launch_requested` | `pending` | `claimed` |
 | `browser_opened` | `claimed` | `waiting_user` |
-| `login_succeeded` | `waiting_user` | `verifying`; read configured store, verify target, then `completed` + `AuthSessionVerified`, or `failed` + `AuthSessionInvalid` |
+| `login_succeeded` | `waiting_user` or `verifying` when lifecycle is keyed to this event id | record/reuse `verifying`; read configured store, verify target, then `completed` + `AuthSessionVerified`, or `failed` + `AuthSessionInvalid` |
 | `login_failed` | `claimed`, `waiting_user`, `verifying` | `failed` + `AuthSessionInvalid` |
 | `cancel` | `pending`, `claimed`, `waiting_user`, `verifying` | `cancelled` |
 | `reauthenticate(auth_ref)` | configured target | create/reuse one nonterminal target request |
 
-Invalid ordering is terminal `rejected/invalid_transition` and leaves the request untouched. Dispatcher calculates `expires_at = created_at + target.ttl_seconds`; each loop atomically changes due nonterminal requests to `expired`, writes deterministic lifecycle, and produces `AuthSessionInvalid` only when invalidating a previously verified session. All clocks are server/Dispatcher UTC.
+Invalid ordering is terminal `rejected/invalid_transition` and leaves the request untouched. `expires_at` is set at create time from `AuthInterventionConfig.request_ttl` (existing positive integer, default 1800 seconds); it is the sole request TTL in this release. `claim_ttl` remains a legacy compatibility setting and is not used by queued event claims (which use the fixed 30-second lease above). Each loop atomically changes due nonterminal requests to `expired`, writes deterministic lifecycle, and produces `AuthSessionInvalid` only when invalidating a previously verified session. All clocks are server/Dispatcher UTC.
 
-Graph effects use `auth-event:<event_id>` or `auth-ttl:<request_id>:<expiry_generation>` as stable source keys, checked before fact/intent creation. A retry cannot duplicate graph records.
+`login_succeeded` is resumable. The first application atomically records `verifying` with the event id before calling external verification. If Dispatcher crashes, the lease retry sees that same event id and status `verifying`, reuses the lifecycle record and runs verification again; any other event is rejected. Completion/failure, lifecycle insertion, queue acknowledgement and graph outbox insertion are one transaction. This prevents a `verifying` request from becoming stuck after a crash.
+
+Graph effects are a transactional `auth_graph_outbox` record keyed by non-null `effect_key` (`auth-event:<event_id>` or `auth-ttl:<request_id>:<expiry_generation>`), with request id, intended fixed Fact kind, state `pending|applied`, and created graph intent/fact ids. A unique `effect_key` is inserted in the same transaction as request/lifecycle/queue acknowledgement. Dispatcher applies pending outbox records through the protocol client and marks their returned ids applied; a retry observes/reuses the row rather than creating another effect. The protocol adds an optional unique `source_key` to auth-generated intents/facts, so a crash after remote graph write but before acknowledgement can be recovered by lookup. A retry cannot duplicate or lose graph records.
 
 ## Endpoint and credential contract
 
@@ -53,7 +55,7 @@ Bearer credentials are deployment configuration, never graph/projection data. Se
 
 Browser identity is an operator session from the deployment reverse proxy/session layer, mapped to explicit project `read`, `cancel`, `reauthenticate` permissions. Without an identity provider UI command ingress is disabled (503); no token is embedded in HTML. Cookie deployments require same-origin + CSRF defense; bearer clients use UUID idempotency keys. Authorization failures are opaque 403/404.
 
-`AuthRequestView` is a strict allowlist: `id`, `project_id`, `source_fact_ids`, `auth_ref`, `role`, `status`, `created_at`, `claimed_at`, `completed_at`, `terminal_summary`. It excludes `login_url`, `reason`, `failure_reason`, `helper_id`, `actor_id`, `event_id`, `state_path`, and all secret-shaped values. Serializer tests assert allowlist equality and adversarial redaction.
+`AuthRequestView` is a strict allowlist: `id`, `project_id`, `source_fact_ids`, `auth_ref`, `role`, `status`, `created_at`, `claimed_at`, `completed_at`, `terminal_summary`. `terminal_summary` is nullable before terminal state and otherwise exactly one fixed enum: `verified`, `login_failed`, `verification_failed`, `cancelled`, or `expired`; it is mapped only from Dispatcher outcome codes, never raw `reason`/`failure_reason`. The view excludes `login_url`, `reason`, `failure_reason`, `helper_id`, `actor_id`, `event_id`, `state_path`, and all secret-shaped values. Serializer tests assert allowlist equality and adversarial redaction.
 
 ## Exact legacy migration
 
@@ -70,7 +72,7 @@ In legacy mode current paths remain. In dual-write, migrated actors are event-on
 
 ## Delivery and verification
 
-1. Guarded DB migrations, schemas, scoped ingress, queue claim/ack/reap, tests.
+1. Guarded DB migrations for queue/lifecycle/outbox and nullable unique source keys, config/example/test coverage for control-plane mode and existing `intervention.request_ttl`, scoped ingress, queue claim/ack/reap, tests.
 2. Dispatcher internal service + CLI/Helper migration away from direct `CairnClient`/`AuthGraphAdapter` writes.
 3. Dual-write parity proof, then enforcement.
 4. Safe projection, operator command endpoint, Timeline/graph rendering, then local `cairn://` bridge.
