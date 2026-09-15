@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import shutil
 import subprocess
+import sys
 import threading
 from contextlib import suppress
 
@@ -48,16 +50,22 @@ class LocalProcess:
         self._kill_lock = threading.Lock()
 
     def start(self) -> None:
+        popen_kwargs: dict[str, object] = {
+            "cwd": self._cwd,
+            "env": self.env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
         self._process = subprocess.Popen(
-            self.command,
-            cwd=self._cwd,
-            env=self.env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=True,
+            self._resolve_command(),
+            **popen_kwargs,
         )
         self._stdout_thread = threading.Thread(
             target=self._drain, args=(self._process.stdout, self._stdout_chunks), daemon=True
@@ -117,11 +125,40 @@ class LocalProcess:
 
     @staticmethod
     def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
+        if os.name == "nt":
+            # Windows has no process groups exposed through os.killpg. taskkill's
+            # tree mode is the native equivalent and also reaches grandchildren.
+            with suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            return
         try:
             os.killpg(os.getpgid(process.pid), sig)
         except (ProcessLookupError, PermissionError):
             with suppress(ProcessLookupError, PermissionError, ValueError):
                 process.send_signal(sig)
+
+    def _resolve_command(self) -> list[str]:
+        if os.name != "nt" or not self.command:
+            return self.command
+        executable = self.command[0]
+        path = self.env.get("PATH") or self.env.get("Path") or ""
+        pathext = self.env.get("PATHEXT") or os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
+        suffixes = tuple(ext.lower() for ext in pathext.split(";") if ext)
+        candidates = [executable]
+        if not os.path.splitext(executable)[1]:
+            candidates.extend(executable + ext for ext in suffixes)
+        for candidate in candidates:
+            resolved = shutil.which(candidate, path=path)
+            if resolved:
+                if executable.lower() == "python3" and "windowsapps" in resolved.lower():
+                    resolved = sys.executable
+                return [resolved, *self.command[1:]]
+        return self.command
 
     @staticmethod
     def _drain(pipe, sink: list[str]) -> None:

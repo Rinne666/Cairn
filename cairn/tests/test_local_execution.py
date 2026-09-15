@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -54,12 +55,75 @@ def test_local_process_inherits_cwd(tmp_path: Path) -> None:
     assert Path(result.stdout.strip()).resolve() == tmp_path.resolve()
 
 
+def test_local_process_resolves_executable_from_supplied_path(tmp_path: Path) -> None:
+    """The subprocess must use the worker environment's PATH, not the parent PATH."""
+    if os.name == "nt":
+        executable = tmp_path / "path-shim.cmd"
+        executable.write_text("@echo path-shim-output\n")
+        command = ["path-shim", "ignored"]
+    else:
+        executable = tmp_path / "path-shim"
+        executable.write_text("#!/bin/sh\nprintf path-shim-output\n")
+        executable.chmod(0o755)
+        command = ["path-shim", "ignored"]
+
+    process = LocalProcess(
+        command,
+        cwd=str(tmp_path),
+        env={"PATH": str(tmp_path)},
+        timeout_seconds=10,
+    )
+    process.start()
+    result = process.communicate(timeout=20)
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "path-shim-output"
+
+
+def test_local_process_uses_windows_process_group_creation(monkeypatch, tmp_path: Path) -> None:
+    """Windows workers use a native process group instead of POSIX session flags."""
+    import cairn.dispatcher.runtime.local_process as local_process_module
+
+    class FakePipe:
+        def read(self, _size: int) -> str:
+            return ""
+
+        def close(self) -> None:
+            pass
+
+    class FakeProcess:
+        pid = 1234
+        stdout = FakePipe()
+        stderr = FakePipe()
+        returncode = 0
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+    captured: dict[str, object] = {}
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(local_process_module.os, "name", "nt")
+    monkeypatch.setattr(local_process_module.subprocess, "Popen", fake_popen)
+    process = LocalProcess(["worker"], str(tmp_path), {"PATH": str(tmp_path)})
+    process.start()
+
+    assert "start_new_session" not in captured
+    assert captured["creationflags"] == local_process_module.subprocess.CREATE_NEW_PROCESS_GROUP
+
+
 def test_local_process_times_out_and_kills_within_grace() -> None:
     process = LocalProcess(
         ["sh", "-c", "sleep 30"],
         cwd=os.getcwd(),
         env=dict(os.environ),
-        timeout_seconds=1,
+        timeout_seconds=3 if os.name == "nt" else 1,
         term_grace_seconds=2,
     )
     process.start()
@@ -73,12 +137,12 @@ def test_local_process_times_out_and_kills_within_grace() -> None:
 
 def test_local_process_kill_terminates_child_process_group(tmp_path: Path) -> None:
     pid_file = tmp_path / "child.pid"
-    script = f"sleep 30 & echo $! > {pid_file}; wait"
+    script = f"sleep 30 & echo $! > {pid_file.as_posix()}; wait"
     process = LocalProcess(
         ["sh", "-c", script],
         cwd=str(tmp_path),
         env=dict(os.environ),
-        timeout_seconds=1,
+        timeout_seconds=3 if os.name == "nt" else 1,
         term_grace_seconds=2,
     )
     process.start()
@@ -89,7 +153,17 @@ def test_local_process_kill_terminates_child_process_group(tmp_path: Path) -> No
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         try:
-            os.kill(child_pid, 0)
+            if os.name == "nt":
+                listing = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {child_pid}"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout
+                if str(child_pid) not in listing:
+                    break
+            else:
+                os.kill(child_pid, 0)
         except ProcessLookupError:
             break
         time.sleep(0.1)
@@ -382,9 +456,13 @@ def _local_config_for_worker(name: str, worker_type: str) -> DispatchConfig:
 def _install_fake_cli(tmp_path: Path, monkeypatch, name: str, body: str) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    script = bin_dir / name
-    script.write_text(f"#!/bin/sh\n{body}\n")
-    script.chmod(0o755)
+    if os.name == "nt":
+        script = bin_dir / f"{name}.cmd"
+        script.write_text(f"@echo off\n{body}\n")
+    else:
+        script = bin_dir / name
+        script.write_text(f"#!/bin/sh\n{body}\n")
+        script.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
 
