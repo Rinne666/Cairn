@@ -6,6 +6,7 @@ import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from cairn.auth_helper.client import AuthHelperClient
 from cairn.auth_helper.desktop import DesktopNotifier
@@ -40,6 +41,12 @@ class AuthHelperConfig:
     max_parallel_logins: int = 1
 
 
+@dataclass(slots=True)
+class _ActiveLogin:
+    request: AuthRequest
+    process: Any | None = None
+
+
 class AuthHelperDaemon:
     """Poll loop for the desktop auth helper.
 
@@ -61,7 +68,7 @@ class AuthHelperDaemon:
         self._notifier = notifier or DesktopNotifier(enabled=config.notification)
         self._launcher = launcher
         self._running = True
-        self._active: dict[str, AuthRequest] = {}
+        self._active: dict[str, _ActiveLogin] = {}
 
     def _launcher_for(self, request: AuthRequest) -> AuthLoginLauncher:
         if self._launcher is not None:
@@ -75,15 +82,32 @@ class AuthHelperDaemon:
     def run_once(self) -> None:
         if not self._running:
             return
-        if len(self._active) >= self.config.max_parallel_logins:
+        self._reap_finished()
+        if self._active_process_count() >= self.config.max_parallel_logins:
             return
         requests = self._client.list_pending()
         for request in requests:
             if not self._running:
                 return
-            if len(self._active) >= self.config.max_parallel_logins:
+            if self._active_process_count() >= self.config.max_parallel_logins:
                 return
             self._handle(request)
+            self._reap_finished()
+
+    def _active_process_count(self) -> int:
+        return sum(entry.process is not None for entry in self._active.values())
+
+    def _reap_finished(self) -> None:
+        for request_id, entry in list(self._active.items()):
+            if entry.process is None:
+                continue
+            try:
+                returncode = entry.process.poll()
+            except Exception as exc:
+                LOG.warning("failed to poll auth login request=%s error=%s", request_id, exc)
+                continue
+            if returncode is not None:
+                self._active.pop(request_id, None)
 
     def _handle(self, request: AuthRequest) -> None:
         if not self._client.claim(request.id, self.config.helper_id):
@@ -91,12 +115,13 @@ class AuthHelperDaemon:
             LOG.info("auth request already claimed by another helper request=%s", request.id)
             return
         LOG.info("auth request claimed request=%s target=%s", request.id, request.auth_ref)
-        self._active[request.id] = request
+        self._active[request.id] = _ActiveLogin(request=request)
         self._notifier.notify_auth_required(request)
         if self.config.auto_launch:
             launcher = self._launcher_for(request)
             try:
                 process = launcher.launch(request)
+                self._active[request.id].process = process
                 # We do not wait here: the login flow runs in its own process and will
                 # drive the request to waiting_user / verifying / completed / failed via
                 # the --request flag. The poll loop keeps running for other requests.
@@ -104,6 +129,7 @@ class AuthHelperDaemon:
             except Exception as exc:
                 LOG.warning("failed to launch auth login request=%s error=%s", request.id, exc)
                 self._client.mark_fail(request.id, f"launcher error: {exc}")
+                self._active.pop(request.id, None)
 
     def run_forever(self) -> None:
         LOG.info("auth helper starting server=%s helper=%s", self.config.server, self.config.helper_id)

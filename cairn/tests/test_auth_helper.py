@@ -67,14 +67,30 @@ class _FakeNotifier(DesktopNotifier):
 class _FakeLauncher:
     def __init__(self) -> None:
         self.launched: list[AuthRequest] = []
+        self.processes: list[_FakeProcess] = []
 
     def launch(self, request: AuthRequest):
         self.launched.append(request)
-        return _FakeProcess()
+        return self.processes.pop(0) if self.processes else _FakeProcess()
 
 
 class _FakeProcess:
     pid = 1234
+
+    def __init__(self, returncode: int | None = None, poll_error: Exception | None = None) -> None:
+        self.returncode = returncode
+        self.poll_error = poll_error
+
+    def poll(self) -> int | None:
+        if self.poll_error is not None:
+            raise self.poll_error
+        return self.returncode
+
+
+class _FailingLauncher(_FakeLauncher):
+    def launch(self, request: AuthRequest):
+        self.launched.append(request)
+        raise RuntimeError("cannot launch")
 
 
 def _config(tmp_path: Path) -> AuthHelperConfig:
@@ -162,6 +178,79 @@ def test_daemon_respects_max_parallel(tmp_path: Path) -> None:
 
     # Only one request handled per tick when max_parallel_logins == 1.
     assert len(launcher.launched) == 1
+
+
+def test_exited_process_is_reclaimed_before_admitting_pending_request(tmp_path: Path) -> None:
+    client = _FakeHelperClient(pending=[_request("auth_001"), _request("auth_002")])
+    launcher = _FakeLauncher()
+    launcher.processes = [_FakeProcess(returncode=0), _FakeProcess()]
+    config = _config(tmp_path)
+    config.auto_launch = True
+    config.max_parallel_logins = 1
+    daemon = AuthHelperDaemon(config, client=client, notifier=_FakeNotifier(), launcher=launcher)
+
+    daemon.run_once()
+
+    assert [request.id for request in launcher.launched] == ["auth_001", "auth_002"]
+    assert set(daemon._active) == {"auth_002"}
+
+
+def test_running_process_remains_active_and_blocks_capacity(tmp_path: Path) -> None:
+    client = _FakeHelperClient(pending=[_request("auth_001"), _request("auth_002")])
+    launcher = _FakeLauncher()
+    launcher.processes = [_FakeProcess()]
+    config = _config(tmp_path)
+    config.auto_launch = True
+    config.max_parallel_logins = 1
+    daemon = AuthHelperDaemon(config, client=client, notifier=_FakeNotifier(), launcher=launcher)
+
+    daemon.run_once()
+    daemon.run_once()
+
+    assert [request.id for request in launcher.launched] == ["auth_001"]
+    assert set(daemon._active) == {"auth_001"}
+
+
+def test_launcher_poll_failure_keeps_entry_active_without_crashing(tmp_path: Path) -> None:
+    client = _FakeHelperClient(pending=[_request("auth_001"), _request("auth_002")])
+    launcher = _FakeLauncher()
+    launcher.processes = [_FakeProcess(poll_error=RuntimeError("poll failed"))]
+    config = _config(tmp_path)
+    config.auto_launch = True
+    config.max_parallel_logins = 1
+    daemon = AuthHelperDaemon(config, client=client, notifier=_FakeNotifier(), launcher=launcher)
+
+    daemon.run_once()
+    daemon.run_once()
+
+    assert [request.id for request in launcher.launched] == ["auth_001"]
+    assert set(daemon._active) == {"auth_001"}
+
+
+def test_auto_launch_disabled_does_not_consume_child_process_capacity(tmp_path: Path) -> None:
+    client = _FakeHelperClient(pending=[_request("auth_001"), _request("auth_002")])
+    config = _config(tmp_path)
+    config.max_parallel_logins = 1
+    daemon = AuthHelperDaemon(config, client=client, notifier=_FakeNotifier(), launcher=_FakeLauncher())
+
+    daemon.run_once()
+
+    assert [request_id for request_id, _ in client.claimed] == ["auth_001", "auth_002"]
+
+
+def test_failed_launch_does_not_leave_stale_capacity(tmp_path: Path) -> None:
+    client = _FakeHelperClient(pending=[_request("auth_001"), _request("auth_002")])
+    launcher = _FailingLauncher()
+    config = _config(tmp_path)
+    config.auto_launch = True
+    config.max_parallel_logins = 1
+    daemon = AuthHelperDaemon(config, client=client, notifier=_FakeNotifier(), launcher=launcher)
+
+    daemon.run_once()
+
+    assert [request.id for request in launcher.launched] == ["auth_001", "auth_002"]
+    assert daemon._active == {}
+    assert len(client.failed) == 2
 
 
 def test_notifier_format_is_readable() -> None:
