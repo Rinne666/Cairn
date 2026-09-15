@@ -229,6 +229,34 @@ def test_internal_deployment_bootstrap_requires_dispatcher_and_replaces_snapshot
     assert any(row["actor_id"] == "desktop-helper" for row in credentials)
 
 
+@pytest.mark.parametrize(
+    ("token", "actor_id", "scopes"),
+    [
+        ("custom-dispatcher-scope-token", "custom-actor", {"dispatcher.auth.consume"}),
+        ("custom-wildcard-token", "custom-actor", {"*"}),
+    ],
+)
+def test_internal_deployment_requires_unambiguous_dispatcher_identity(
+    client: TestClient, token: str, actor_id: str, scopes: set[str]
+) -> None:
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            token,
+            actor_id=actor_id,
+            scopes=scopes,
+            project_allowlist={"*"},
+        )
+
+    response = client.post(
+        "/internal/auth/deployment",
+        json={"targets": {"custom": "https://custom.example/login"}},
+        headers=_headers(token, proto="https"),
+    )
+
+    assert response.status_code == 403
+
+
 def test_internal_deployment_bootstrap_rejects_invalid_snapshot_without_partial_update(client: TestClient) -> None:
     with db.get_conn() as conn:
         conn.execute("INSERT INTO auth_target_configs VALUES ('stale', 'https://stale.example/login')")

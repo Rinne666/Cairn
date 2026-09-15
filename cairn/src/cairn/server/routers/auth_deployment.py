@@ -17,12 +17,9 @@ def apply_auth_deployment(
     """Apply a Dispatcher-owned auth deployment snapshot in one DB transaction."""
     with get_conn() as conn:
         principal = require_auth_principal(request, conn, scope="dispatcher.auth.consume")
-        # A helper credential must never be able to cross into deployment control,
-        # even if someone accidentally grants it the dispatcher scope.
-        if principal.actor_id == "helper" or {
-            "helper.event.submit",
-            "helper.request.read",
-        } & principal.scopes:
+        # This endpoint is a deployment control plane: authorization must identify
+        # the Dispatcher credential exactly, rather than relying on broad scopes.
+        if principal.actor_id != "dispatcher" or principal.scopes != frozenset({"dispatcher.auth.consume"}):
             raise HTTPException(403, "Forbidden")
         try:
             bootstrap_auth_deployment(
