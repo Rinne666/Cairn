@@ -20,7 +20,7 @@ This phase is a prerequisite for UI work because it establishes safe UI data, ti
 
 ### AuthEvent contract
 
-`auth_events` is an append-only control-plane queue, separate from Facts, Intents, and AuthRequests. Its additive SQLite migration stores `id`, `project_id`, `request_id`, `kind`, `idempotency_key`, `actor_id`, safe metadata, timestamps, and processing outcome. Valid Helper-originated kinds are `launch_requested`, `browser_opened`, `login_succeeded`, and `login_failed`; UI-originated operations are translated by the local Helper, never posted by browser JavaScript. A unique `(actor_id, idempotency_key)` constraint makes retries safe. The Server validates project/request association and persists events but does not change AuthRequest state. Dispatcher polls unprocessed events, validates configured target metadata, applies the only allowed state transition, writes graph results, and marks the event outcome atomically enough for retry-safe consumption.
+`auth_events` is an append-only control-plane queue, separate from Facts, Intents, and AuthRequests. Its additive SQLite migration stores `id`, `project_id`, `request_id`, `kind`, `idempotency_key`, `actor_id`, safe metadata, timestamps, and processing outcome. Valid Helper-originated kinds are `launch_requested`, `browser_opened`, `login_succeeded`, and `login_failed`; UI-originated operations enqueue restricted commands. Browser JavaScript never transitions an AuthRequest, launches a browser, or submits an AuthEvent. A unique `(actor_id, idempotency_key)` constraint makes retries safe. The Server validates project/request association and persists events but does not make business transitions. Dispatcher polls unprocessed events, validates configured target metadata, applies the only allowed state transition, writes graph results, and marks outcome through its internal control-plane RPC.
 
 Helpers authenticate event submission with a configured per-helper bearer secret held only in their local execution environment. The event API never accepts session material, URL overrides, role overrides, raw browser errors, or arbitrary payload text. Remote Helpers use the same HTTPS event API; local deep links only activate the installed local Helper and do not require a colocated Dispatcher.
 
@@ -34,8 +34,7 @@ Add a project-scoped metadata-only read endpoint, `GET /projects/{project_id}/au
 
 Add project-scoped actions only where the server can safely coordinate state:
 
-- `POST /auth-requests/{id}/cancel`, allowed only for `pending`, `claimed`, or `waiting_user` and recorded as a terminal event;
-- `POST /projects/{project_id}/auth-requests/{auth_ref}/reauthenticate`, which Dispatcher validates against its configured target before creating/reusing a request. The Server accepts only an opaque Dispatcher-authenticated command, never a UI-supplied role or URL.
+- `POST /auth-commands` queues `cancel(request_id)` or `reauthenticate(auth_ref)` with an authenticated operator identity and idempotency key. Dispatcher validates its configured target before creating/reusing a request. There are no direct cancel/reauthenticate transition routes and no UI-supplied role or URL.
 
 The initial UI action is deliberately not a Server "launch browser" endpoint. `Open Login` navigates to `cairn://auth/<request_id>`; a registered local Helper opens a local IPC connection to Dispatcher, which validates the request and authorizes its browser action. The protocol handler is registered by `cairn auth-helper install-uri-handler` and tested separately. The UI cannot reliably detect OS registration, so it displays a fixed local-helper instruction after navigation rather than claiming the handler is unavailable.
 

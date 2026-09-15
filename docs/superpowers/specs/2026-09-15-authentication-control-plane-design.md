@@ -4,19 +4,19 @@
 
 ## Authority and deployment boundary
 
-- **Server** persists requests, queues, lifecycle records and read projections. Its only state mutation outside Dispatcher is atomic lease recovery which returns an abandoned queue claim to `retryable`; it never changes `AuthRequest.status`, reads AuthStore, or writes graph data.
-- **Dispatcher** owns the transaction that applies an event/command: it validates identity and state, advances `AuthRequest`, appends lifecycle, marks queue result, then writes idempotent graph facts/intents. It is the sole TTL reaper.
+- **Server** persists requests, queues, lifecycle records and read projections. It exposes a Dispatcher-authenticated internal *apply RPC* which executes one SQLite `BEGIN IMMEDIATE` transaction for queue acknowledgement, request/lifecycle mutation and outbox insertion. It is a storage transaction executor, not a business decision-maker; it never reads AuthStore or graph data.
+- **Dispatcher** is the sole business writer: it claims events through HTTP, validates config/identity/state, verifies AuthStore, decides the transition and asks Server's internal apply RPC to commit that decision. It schedules the sole TTL reaper call; Server executes its approved transition atomically.
 - **Helper/CLI** owns interactive browser capture and is the only component writing a local `AuthStore`. It never imports `CairnClient` or `AuthGraphAdapter`; it submits an event after browser progress/capture and does not complete a request.
-- **Dispatcher and Helper share the configured AuthStore namespace** per target. Local mode uses one absolute `auth.store_root`; container/distributed mode uses a deployment-mounted, access-controlled shared volume. Dispatcher is read-only and Helper read/write. If this cannot be guaranteed, `login_succeeded` is rejected as `store_unavailable`.
+- **Dispatcher and Helper share the configured AuthStore namespace** per target. Local mode uses one absolute `auth.store_root`; container/distributed mode uses a deployment-mounted, access-controlled shared volume. Dispatcher is read-only and Helper read/write. A Helper capture atomically writes a non-secret manifest `{request_id, auth_ref, actor_id, capture_generation, captured_at}` beside its state; Dispatcher accepts `login_succeeded` only when this manifest matches event/request actor and configured target. If this mount/binding cannot be verified, the event is `store_unavailable` or `capture_mismatch`.
 - **Web UI** has no direct transition route. It sees `AuthRequestView`; browser commands enqueue work and never contain a URL, role, verification input or secret.
 
 `AuthTargetConfig` addressed by `auth_ref` is the only authority for role, login URL, profile, verification policy, TTL and graph descriptions. Event/command attempts to supply any of those values are `schema_rejected`.
 
 ## Canonical durable schema
 
-`auth_events` is append-only: `id` (server-generated immutable opaque id), `project_id`, `request_id`, `auth_ref`, `kind`, `actor_id`, `idempotency_key`, `occurred_at`, `received_at`, `state`, `attempt_count`, `next_attempt_at`, `claimed_by`, `claim_expires_at`, `processed_at`, `outcome_code`. `(actor_id, idempotency_key)` is unique; the project/request/auth_ref relation is validated. `kind` is exactly `launch_requested|browser_opened|login_succeeded|login_failed`; state is exactly `queued|claimed|retryable|applied|rejected`.
+`auth_events` is append-only: `id` (server-generated immutable opaque id), `project_id`, `request_id`, `auth_ref`, `kind`, `actor_id`, `idempotency_key`, `occurred_at`, `received_at`, `state`, `attempt_count`, `next_attempt_at`, `claimed_by`, `claim_expires_at`, `processed_at`, `outcome_code`, and nullable `capture_generation` (required only by `login_succeeded`). `(actor_id, idempotency_key)` is unique; the project/request/auth_ref relation is validated. `kind` is exactly `launch_requested|browser_opened|login_succeeded|login_failed`; state is exactly `queued|claimed|retryable|applied|rejected`.
 
-The accepted event JSON is exactly `{project_id, request_id, auth_ref, kind, idempotency_key, occurred_at}`. Unknown fields cause 422. There is no payload or free-text/URL/cookie/credential/browser-error/profile-path/role metadata column.
+The accepted event JSON is exactly `{project_id, request_id, auth_ref, kind, idempotency_key, occurred_at, capture_generation?}`. Unknown fields cause 422. `launch_requested` atomically binds `AuthRequest.helper_actor_id` to the event actor; browser/success/failure events must match that binding, otherwise they are `rejected/not_request_owner`. There is no payload or free-text/URL/cookie/credential/browser-error/profile-path/role metadata column.
 
 `auth_commands` has the same queue, lease and idempotency columns. Its `kind` is `cancel|reauthenticate`; it has exactly one selector: `request_id` for cancel, or `auth_ref` for reauthenticate. Both/neither is 422. Success returns only `{command_id, state: "queued"}`.
 
@@ -24,7 +24,7 @@ The accepted event JSON is exactly `{project_id, request_id, auth_ref, kind, ide
 
 ## Consumption, transitions, and expiry
 
-In a `BEGIN IMMEDIATE` transaction Dispatcher selects the oldest eligible queued/retryable record and updates it to `claimed`, `claimed_by=dispatcher_instance_id`, `claim_expires_at=server_now+30s`, incrementing `attempt_count`. Only its unexpired claim can apply. A reclaimed lease becomes `retryable` with exponential server-clock backoff; three attempts ends `rejected/retry_exhausted`. Applied/rejected records are replay no-ops. Reuse of an idempotency key with different immutable data returns 409; identical data returns the original record.
+Dispatcher asks the Server's internal queue RPC to run `BEGIN IMMEDIATE`, select the oldest eligible queued/retryable record, and update it to `claimed`, `claimed_by=dispatcher_instance_id`, `claim_expires_at=server_now+30s`, incrementing `attempt_count`. Only its unexpired claim can be applied by that same Dispatcher through the internal apply RPC. A Server lease-recovery RPC returns expired claims to `retryable` with exponential server-clock backoff; three attempts ends `rejected/retry_exhausted`. Applied/rejected records are replay no-ops. Reuse of an idempotency key with different immutable data returns 409; identical data returns the original record.
 
 | Input | Required status | Dispatcher result |
 |---|---|---|
@@ -35,11 +35,11 @@ In a `BEGIN IMMEDIATE` transaction Dispatcher selects the oldest eligible queued
 | `cancel` | `pending`, `claimed`, `waiting_user`, `verifying` | `cancelled` |
 | `reauthenticate(auth_ref)` | configured target | create/reuse one nonterminal target request |
 
-Invalid ordering is terminal `rejected/invalid_transition` and leaves the request untouched. `expires_at` is set at create time from `AuthInterventionConfig.request_ttl` (existing positive integer, default 1800 seconds); it is the sole request TTL in this release. `claim_ttl` remains a legacy compatibility setting and is not used by queued event claims (which use the fixed 30-second lease above). Each loop atomically changes due nonterminal requests to `expired`, writes deterministic lifecycle, and produces `AuthSessionInvalid` only when invalidating a previously verified session. All clocks are server/Dispatcher UTC.
+Invalid ordering is terminal `rejected/invalid_transition` and leaves the request untouched. `expires_at` is set at create time from the Server setting `auth_request_ttl` (existing nonnegative integer; default 1800 seconds; zero disables expiry). `auth_claim_ttl` remains a legacy request-claim setting and is not used by queued event claims (which use the fixed 30-second lease above). Dispatcher schedules the Server internal expiry RPC, which atomically changes due nonterminal requests to `expired`, writes deterministic lifecycle, and produces `AuthSessionInvalid` only when invalidating a previously verified session. All clocks are server/Dispatcher UTC.
 
 `login_succeeded` is resumable. The first application atomically records `verifying` with the event id before calling external verification. If Dispatcher crashes, the lease retry sees that same event id and status `verifying`, reuses the lifecycle record and runs verification again; any other event is rejected. Completion/failure, lifecycle insertion, queue acknowledgement and graph outbox insertion are one transaction. This prevents a `verifying` request from becoming stuck after a crash.
 
-Graph effects are a transactional `auth_graph_outbox` record keyed by non-null `effect_key` (`auth-event:<event_id>` or `auth-ttl:<request_id>:<expiry_generation>`), with request id, intended fixed Fact kind, state `pending|applied`, and created graph intent/fact ids. A unique `effect_key` is inserted in the same transaction as request/lifecycle/queue acknowledgement. Dispatcher applies pending outbox records through the protocol client and marks their returned ids applied; a retry observes/reuses the row rather than creating another effect. The protocol adds an optional unique `source_key` to auth-generated intents/facts, so a crash after remote graph write but before acknowledgement can be recovered by lookup. A retry cannot duplicate or lose graph records.
+Graph effects are a transactional `auth_graph_outbox` record keyed by non-null `effect_key` (`auth-event:<event_id>` or `auth-ttl:<request_id>:<expiry_generation>`), with request id, intended fixed Fact kind, state `pending|intent_created|fact_created`, and separately unique `intent_source_key`/`fact_source_key`. The internal apply RPC inserts this outbox in the same transaction as request/lifecycle/queue acknowledgement. Dispatcher first calls idempotent `create_intent(source_key)`, records returned intent id using an internal outbox ack RPC, then idempotent `conclude_intent(source_key)` and records fact id. Server stores nullable unique `source_key` on auth-generated intents and facts and supplies lookup by source key. On a crash, Dispatcher resumes the recorded next step; the same source key returns the existing object instead of duplicating it. A retry cannot duplicate or lose graph records.
 
 ## Endpoint and credential contract
 
@@ -59,7 +59,7 @@ Browser identity is an operator session from the deployment reverse proxy/sessio
 
 ## Exact legacy migration
 
-`auth_control_plane_mode` is a Pydantic Server/Dispatcher setting: `legacy|dual_write|enforced`. Upgrades default legacy; fresh installs may default enforced only after parity tests pass.
+`auth_control_plane_mode` is a Pydantic Server/Dispatcher setting: `legacy|dual_write|enforced`. Upgrades default legacy; fresh installs may default enforced only after parity tests pass. Existing Server DB settings `auth_request_ttl` and `auth_claim_ttl` remain the sole authoritative TTL values during migration. Dispatcher reads them from `GET /settings` and refuses startup if its legacy `intervention.request_ttl`/`claim_ttl` differ. The config fields are then deprecated and removed in the next major version; no request uses config TTL directly.
 
 | Current raw route/caller | Replacement | Enforced behavior |
 |---|---|---|
