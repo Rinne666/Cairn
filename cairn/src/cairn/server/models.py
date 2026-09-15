@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Settings(BaseModel):
@@ -322,3 +324,101 @@ class ClaimAuthRequest(BaseModel):
 
 class FailAuthRequest(BaseModel):
     failure_reason: str | None = None
+
+
+AuthEventKind = Literal[
+    "launch_requested",
+    "browser_opened",
+    "login_succeeded",
+    "login_failed",
+]
+AuthEventState = Literal["queued", "claimed", "retryable", "applied", "rejected"]
+
+
+class CreateAuthEvent(BaseModel):
+    """The intentionally closed event ingress contract used by Helpers/CLI."""
+
+    model_config = {"extra": "forbid"}
+
+    project_id: str
+    request_id: str
+    auth_ref: str
+    kind: AuthEventKind
+    idempotency_key: UUID
+    occurred_at: str
+    capture_generation: int | None = Field(default=None, ge=0)
+
+    @field_validator("project_id", "request_id", "auth_ref")
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+    @field_validator("occurred_at")
+    @classmethod
+    def validate_occurred_at(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("must be an ISO-8601 timestamp") from exc
+        return text
+
+    @model_validator(mode="after")
+    def validate_capture_generation(self) -> "CreateAuthEvent":
+        if self.kind == "login_succeeded" and self.capture_generation is None:
+            raise ValueError("capture_generation is required for login_succeeded")
+        if self.kind != "login_succeeded" and self.capture_generation is not None:
+            raise ValueError("capture_generation is only valid for login_succeeded")
+        return self
+
+
+class AuthEvent(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: str
+    project_id: str
+    request_id: str
+    auth_ref: str
+    kind: AuthEventKind
+    actor_id: str
+    idempotency_key: UUID
+    occurred_at: str
+    received_at: str
+    state: AuthEventState
+    attempt_count: int = 0
+    next_attempt_at: str | None = None
+    claimed_by: str | None = None
+    claim_expires_at: str | None = None
+    processed_at: str | None = None
+    outcome_code: str | None = None
+    capture_generation: int | None = None
+
+
+class AuthHelperRequestView(BaseModel):
+    """Strict, helper-scoped projection; never expose reason or failure details."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    auth_ref: str
+    login_url: str | None = None
+    status: AuthRequestStatus
+
+
+class AuthCredential(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: int
+    token_digest: str
+    actor_id: str
+    scopes: list[str]
+    project_allowlist: list[str]
+    not_before: str
+    expires_at: str | None = None
+    replaced_by: str | None = None
+    created_at: str

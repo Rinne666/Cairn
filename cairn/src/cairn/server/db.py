@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Generator
 
@@ -95,10 +96,61 @@ CREATE TABLE IF NOT EXISTS auth_requests (
     created_at TEXT NOT NULL,
     claimed_at TEXT,
     completed_at TEXT,
-    failure_reason TEXT
+    failure_reason TEXT,
+    helper_actor_id TEXT,
+    expires_at TEXT,
+    expiry_generation INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_requests_project ON auth_requests (project_id, auth_ref);
+
+CREATE TABLE IF NOT EXISTS auth_events (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    auth_ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('launch_requested', 'browser_opened', 'login_succeeded', 'login_failed')),
+    actor_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'claimed', 'retryable', 'applied', 'rejected')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    claimed_by TEXT,
+    claim_expires_at TEXT,
+    processed_at TEXT,
+    outcome_code TEXT,
+    capture_generation INTEGER,
+    UNIQUE (actor_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_events_queue ON auth_events (state, next_attempt_at, received_at);
+
+CREATE TABLE IF NOT EXISTS auth_lifecycle_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    outcome_code TEXT NOT NULL,
+    UNIQUE (request_id, event_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS auth_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_digest TEXT NOT NULL UNIQUE,
+    actor_id TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    project_allowlist TEXT NOT NULL,
+    not_before TEXT NOT NULL,
+    expires_at TEXT,
+    replaced_by TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_credentials_actor ON auth_credentials (actor_id);
 """
 
 
@@ -112,6 +164,8 @@ def configure(path: Path) -> None:
         conn.executescript(SCHEMA)
         _ensure_project_columns(conn)
         _ensure_settings_columns(conn)
+        _ensure_auth_request_columns(conn)
+        _ensure_auth_schema(conn)
 
 
 def _ensure_project_columns(conn: sqlite3.Connection) -> None:
@@ -134,6 +188,90 @@ def _ensure_settings_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE settings ADD COLUMN auth_request_ttl INTEGER NOT NULL DEFAULT 1800"
         )
+
+
+def _ensure_auth_request_columns(conn: sqlite3.Connection) -> None:
+    """Add Phase 1 auth request columns to databases created by older Cairn versions."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(auth_requests)")}
+    if "helper_actor_id" not in columns:
+        conn.execute("ALTER TABLE auth_requests ADD COLUMN helper_actor_id TEXT")
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE auth_requests ADD COLUMN expires_at TEXT")
+    if "expiry_generation" not in columns:
+        conn.execute(
+            "ALTER TABLE auth_requests ADD COLUMN expiry_generation INTEGER NOT NULL DEFAULT 1"
+        )
+
+    ttl_row = conn.execute(
+        "SELECT auth_request_ttl FROM settings WHERE rowid = 1"
+    ).fetchone()
+    ttl = int(ttl_row["auth_request_ttl"]) if ttl_row is not None else 1800
+    rows = conn.execute(
+        "SELECT id, created_at FROM auth_requests WHERE expires_at IS NULL"
+    ).fetchall()
+    for row in rows:
+        expires_at = _expiry_for(row["created_at"], ttl)
+        conn.execute(
+            "UPDATE auth_requests SET expires_at = ? WHERE id = ?",
+            (expires_at, row["id"]),
+        )
+
+
+def _expiry_for(created_at: str, ttl: int) -> str | None:
+    if ttl <= 0:
+        return None
+    try:
+        parsed = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed + timedelta(seconds=ttl)).astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _ensure_auth_schema(conn: sqlite3.Connection) -> None:
+    """Backfill deterministic lifecycle records for pre-event auth requests."""
+    rows = conn.execute(
+        "SELECT id, status, created_at, completed_at FROM auth_requests ORDER BY rowid"
+    ).fetchall()
+    terminal_statuses = {"completed", "failed", "cancelled", "expired"}
+    for row in rows:
+        request_id = row["id"]
+        existing = conn.execute(
+            "SELECT COUNT(*) AS count FROM auth_lifecycle_events WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if existing["count"]:
+            continue
+        created_at = row["created_at"]
+        conn.execute(
+            """
+            INSERT INTO auth_lifecycle_events
+                (request_id, event_id, sequence, kind, recorded_at, outcome_code)
+            VALUES (?, ?, 1, 'created', ?, 'created')
+            """,
+            (request_id, f"backfill:create:{request_id}", created_at),
+        )
+        if row["status"] in terminal_statuses:
+            recorded_at = row["completed_at"] or created_at
+            conn.execute(
+                """
+                INSERT INTO auth_lifecycle_events
+                    (request_id, event_id, sequence, kind, recorded_at, outcome_code)
+                VALUES (?, ?, 2, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    f"backfill:terminal:{request_id}",
+                    row["status"],
+                    recorded_at,
+                    row["status"],
+                ),
+            )
 
 
 @contextmanager

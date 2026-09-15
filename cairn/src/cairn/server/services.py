@@ -1,14 +1,231 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
+import ipaddress
+import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from datetime import timedelta
+from typing import Iterable
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
-from cairn.server.models import Intent, ProjectMeta, ProjectReason
+from cairn.server.models import AuthCredential, AuthEvent, Intent, ProjectMeta, ProjectReason
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass(frozen=True)
+class AuthPrincipal:
+    actor_id: str
+    scopes: frozenset[str]
+    project_allowlist: frozenset[str]
+    credential_id: int
+    token_digest: str
+
+
+def _credential_model(row: sqlite3.Row) -> AuthCredential:
+    return AuthCredential(
+        id=row["id"],
+        token_digest=row["token_digest"],
+        actor_id=row["actor_id"],
+        scopes=json.loads(row["scopes"]),
+        project_allowlist=json.loads(row["project_allowlist"]),
+        not_before=row["not_before"],
+        expires_at=row["expires_at"],
+        replaced_by=row["replaced_by"],
+        created_at=row["created_at"],
+    )
+
+
+def provision_auth_credential(
+    conn: sqlite3.Connection,
+    token: str,
+    *,
+    actor_id: str,
+    scopes: Iterable[str],
+    project_allowlist: Iterable[str] = (),
+    not_before: str | None = None,
+    expires_at: str | None = None,
+) -> AuthCredential:
+    """Store only an operator-provided bearer token digest.
+
+    This function is deliberately an internal provisioning primitive: callers receive
+    the metadata model, while the opaque token is never persisted or returned.
+    An empty project allowlist means no projects; use ``*`` for an operator-wide
+    credential explicitly.
+    """
+    if not token:
+        raise ValueError("token must not be empty")
+    actor_id = actor_id.strip()
+    scope_values = sorted({str(value).strip() for value in scopes if str(value).strip()})
+    project_values = sorted({str(value).strip() for value in project_allowlist if str(value).strip()})
+    if not actor_id or not scope_values:
+        raise ValueError("actor_id and scopes are required")
+    now = not_before or utcnow()
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO auth_credentials
+                (token_digest, actor_id, scopes, project_allowlist, not_before, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (digest, actor_id, json.dumps(scope_values), json.dumps(project_values), now, expires_at, utcnow()),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("credential already exists") from exc
+    row = conn.execute("SELECT * FROM auth_credentials WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    assert row is not None
+    return _credential_model(row)
+
+
+def lookup_auth_credential(
+    conn: sqlite3.Connection, token: str, *, now: str | None = None
+) -> AuthPrincipal | None:
+    """Resolve a token by SHA-256 digest and enforce its validity window."""
+    if not token:
+        return None
+    current = now or utcnow()
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    row = conn.execute(
+        """
+        SELECT * FROM auth_credentials
+        WHERE token_digest = ?
+          AND not_before <= ?
+          AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (digest, current, current),
+    ).fetchone()
+    if row is None:
+        return None
+    return AuthPrincipal(
+        actor_id=row["actor_id"],
+        scopes=frozenset(json.loads(row["scopes"])),
+        project_allowlist=frozenset(json.loads(row["project_allowlist"])),
+        credential_id=row["id"],
+        token_digest=row["token_digest"],
+    )
+
+
+def auth_token_digest(token: str) -> str:
+    """Return the persisted representation for an opaque bearer token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# Names kept intentionally small and descriptive for deployment bootstrap callers.
+resolve_bearer_credential = lookup_auth_credential
+resolve_auth_credential = lookup_auth_credential
+
+
+def rotate_auth_credential(
+    conn: sqlite3.Connection,
+    old_token: str,
+    new_token: str,
+    *,
+    overlap_seconds: int = 300,
+) -> AuthCredential:
+    if overlap_seconds < 0:
+        raise ValueError("overlap_seconds must be non-negative")
+    old_digest = hashlib.sha256(old_token.encode("utf-8")).hexdigest()
+    old = conn.execute("SELECT * FROM auth_credentials WHERE token_digest = ?", (old_digest,)).fetchone()
+    if old is None:
+        raise ValueError("credential not found")
+    new = provision_auth_credential(
+        conn,
+        new_token,
+        actor_id=old["actor_id"],
+        scopes=json.loads(old["scopes"]),
+        project_allowlist=json.loads(old["project_allowlist"]),
+    )
+    overlap_dt = datetime.now(timezone.utc) + timedelta(seconds=overlap_seconds)
+    if old["expires_at"]:
+        try:
+            old_expiry = datetime.strptime(old["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            old_expiry = datetime.fromisoformat(old["expires_at"].replace("Z", "+00:00"))
+            if old_expiry.tzinfo is None:
+                old_expiry = old_expiry.replace(tzinfo=timezone.utc)
+        overlap_dt = min(overlap_dt, old_expiry)
+    overlap = overlap_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        "UPDATE auth_credentials SET expires_at = ?, replaced_by = ? WHERE id = ?",
+        (overlap, str(new.id), old["id"]),
+    )
+    return new
+
+
+def revoke_auth_credential(conn: sqlite3.Connection, token_or_digest: str) -> bool:
+    digest = token_or_digest
+    if len(token_or_digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in token_or_digest):
+        digest = hashlib.sha256(token_or_digest.encode("utf-8")).hexdigest()
+    cursor = conn.execute(
+        "UPDATE auth_credentials SET expires_at = ? WHERE token_digest = ?",
+        (utcnow(), digest.lower()),
+    )
+    return cursor.rowcount == 1
+
+
+def require_auth_principal(
+    request: Request,
+    conn: sqlite3.Connection,
+    *,
+    scope: str,
+    project_id: str | None = None,
+) -> AuthPrincipal:
+    require_secure_bearer_transport(request)
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token or " " in token.strip():
+        raise HTTPException(401, "Authentication required")
+    principal = lookup_auth_credential(conn, token.strip())
+    if principal is None:
+        raise HTTPException(401, "Authentication required")
+    if scope not in principal.scopes and "*" not in principal.scopes:
+        raise HTTPException(403, "Forbidden")
+    if project_id is not None and "*" not in principal.project_allowlist and project_id not in principal.project_allowlist:
+        raise HTTPException(403, "Forbidden")
+    return principal
+
+
+def require_secure_bearer_transport(request: Request) -> None:
+    """Require HTTPS unless the request is clearly loopback or proxy-marked HTTPS."""
+    forwarded = request.headers.get("forwarded", "")
+    forwarded_proto = next(
+        (part.split("=", 1)[1].strip(' "') for part in forwarded.split(";") if part.strip().lower().startswith("proto=")),
+        "",
+    )
+    proxy_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    if request.url.scheme.lower() == "https" or proxy_proto == "https" or forwarded_proto.lower() == "https":
+        return
+    hosts = {
+        (request.client.host if request.client else "").strip("[]").lower(),
+        (request.url.hostname or "").strip("[]").lower(),
+    }
+    is_loopback = False
+    for host in hosts:
+        try:
+            is_loopback = is_loopback or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = is_loopback or host in {"localhost", "localhost.localdomain"}
+    if not is_loopback:
+        raise HTTPException(400, "Bearer credentials require HTTPS")
+
+
+def auth_event_to_model(row: sqlite3.Row) -> AuthEvent:
+    from cairn.server.models import AuthEvent
+
+    return AuthEvent(
+        id=row["id"], project_id=row["project_id"], request_id=row["request_id"], auth_ref=row["auth_ref"],
+        kind=row["kind"], actor_id=row["actor_id"], idempotency_key=row["idempotency_key"], occurred_at=row["occurred_at"],
+        received_at=row["received_at"], state=row["state"], attempt_count=row["attempt_count"], next_attempt_at=row["next_attempt_at"],
+        claimed_by=row["claimed_by"], claim_expires_at=row["claim_expires_at"], processed_at=row["processed_at"],
+        outcome_code=row["outcome_code"], capture_generation=row["capture_generation"],
+    )
 
 
 def next_project_id(conn: sqlite3.Connection) -> str:
