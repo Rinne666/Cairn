@@ -28,6 +28,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # --------------------------------------------------------------------------- LocalProcess
 
 
+def _long_running_command() -> list[str]:
+    if os.name == "nt":
+        return [sys.executable, "-c", "import time; time.sleep(30)"]
+    return ["sh", "-c", "sleep 30"]
+
+
 def test_local_process_captures_stdout_and_exit_code() -> None:
     process = LocalProcess(
         ["python3", "-c", "import sys; print('hello'); sys.exit(3)"],
@@ -142,7 +148,7 @@ def test_local_process_windows_termination_escalates_after_grace(monkeypatch) ->
 
 def test_local_process_times_out_and_kills_within_grace() -> None:
     process = LocalProcess(
-        ["sh", "-c", "sleep 30"],
+        _long_running_command(),
         cwd=os.getcwd(),
         env=dict(os.environ),
         timeout_seconds=3 if os.name == "nt" else 1,
@@ -204,7 +210,7 @@ def test_local_process_kill_terminates_child_process_group(tmp_path: Path) -> No
 
 def test_local_process_cancel_records_reason() -> None:
     process = LocalProcess(
-        ["sh", "-c", "sleep 30"],
+        _long_running_command(),
         cwd=os.getcwd(),
         env=dict(os.environ),
         timeout_seconds=30,
