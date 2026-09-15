@@ -241,10 +241,18 @@ def test_local_backend_merges_host_env_with_worker_env(tmp_path: Path, monkeypat
     backend = LocalBackend(LocalConfig(workspace_root=str(tmp_path)))
     handle = backend.ensure_running("proj_001")
 
+    if os.name == "nt":
+        command = [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['CAIRN_HOST_VAR'] + '-' + os.environ['CAIRN_WORKER_VAR'], end='')",
+        ]
+    else:
+        command = ["sh", "-c", 'printf "%s-%s" "$CAIRN_HOST_VAR" "$CAIRN_WORKER_VAR"']
     process = backend.build_exec_process(
         handle,
         {"CAIRN_WORKER_VAR": "worker"},
-        ["sh", "-c", 'printf "%s-%s" "$CAIRN_HOST_VAR" "$CAIRN_WORKER_VAR"'],
+        command,
         timeout_seconds=10,
     )
     process.start()
@@ -270,10 +278,18 @@ def test_local_common_env_reaches_worker_subprocess(tmp_path: Path, monkeypatch)
     assert config.local is not None
     backend = LocalBackend(config.local)
     handle = backend.ensure_running("proj_001")
+    if os.name == "nt":
+        command = [
+            sys.executable,
+            "-c",
+            "import os; print('|'.join(os.environ[k] for k in ('https_proxy', 'http_proxy', 'all_proxy')), end='')",
+        ]
+    else:
+        command = ["sh", "-c", 'printf "%s|%s|%s" "$https_proxy" "$http_proxy" "$all_proxy"']
     process = backend.build_exec_process(
         handle,
         dict(worker.env),
-        ["sh", "-c", 'printf "%s|%s|%s" "$https_proxy" "$http_proxy" "$all_proxy"'],
+        command,
         timeout_seconds=10,
     )
     process.start()
