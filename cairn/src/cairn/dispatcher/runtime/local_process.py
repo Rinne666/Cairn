@@ -121,16 +121,19 @@ class LocalProcess:
                 return
             except subprocess.TimeoutExpired:
                 pass
-            self._signal_group(process, signal.SIGKILL)
+            self._signal_group(process, signal.SIGTERM, force=True)
 
     @staticmethod
-    def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
+    def _signal_group(process: subprocess.Popen[str], sig: int, force: bool = False) -> None:
         if os.name == "nt":
             # Windows has no process groups exposed through os.killpg. taskkill's
             # tree mode is the native equivalent and also reaches grandchildren.
             with suppress(OSError, subprocess.SubprocessError):
+                command = ["taskkill", "/PID", str(process.pid), "/T"]
+                if force:
+                    command.append("/F")
                 subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    command,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,

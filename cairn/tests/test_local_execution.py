@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -118,6 +119,27 @@ def test_local_process_uses_windows_process_group_creation(monkeypatch, tmp_path
     assert captured["creationflags"] == local_process_module.subprocess.CREATE_NEW_PROCESS_GROUP
 
 
+def test_local_process_windows_termination_escalates_after_grace(monkeypatch) -> None:
+    import cairn.dispatcher.runtime.local_process as local_process_module
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+    monkeypatch.setattr(local_process_module.os, "name", "nt")
+    monkeypatch.setattr(local_process_module.subprocess, "run", fake_run)
+    process = type("Process", (), {"pid": 1234})()
+
+    local_process_module.LocalProcess._signal_group(process, local_process_module.signal.SIGTERM)
+    local_process_module.LocalProcess._signal_group(process, local_process_module.signal.SIGTERM, force=True)
+
+    assert calls == [
+        ["taskkill", "/PID", "1234", "/T"],
+        ["taskkill", "/PID", "1234", "/T", "/F"],
+    ]
+
+
 def test_local_process_times_out_and_kills_within_grace() -> None:
     process = LocalProcess(
         ["sh", "-c", "sleep 30"],
@@ -137,9 +159,18 @@ def test_local_process_times_out_and_kills_within_grace() -> None:
 
 def test_local_process_kill_terminates_child_process_group(tmp_path: Path) -> None:
     pid_file = tmp_path / "child.pid"
-    script = f"sleep 30 & echo $! > {pid_file.as_posix()}; wait"
+    if os.name == "nt":
+        script = (
+            "import os, subprocess, sys, time; "
+            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"open(r'{pid_file}', 'w').write(str(child.pid)); child.wait()"
+        )
+        command = [sys.executable, "-c", script]
+    else:
+        script = f"sleep 30 & echo $! > {pid_file}; wait"
+        command = ["sh", "-c", script]
     process = LocalProcess(
-        ["sh", "-c", script],
+        command,
         cwd=str(tmp_path),
         env=dict(os.environ),
         timeout_seconds=3 if os.name == "nt" else 1,
