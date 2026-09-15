@@ -155,6 +155,12 @@ CREATE TABLE IF NOT EXISTS auth_credentials (
 
 CREATE INDEX IF NOT EXISTS idx_auth_credentials_actor ON auth_credentials (actor_id);
 
+CREATE TABLE IF NOT EXISTS auth_credential_cutovers (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    acknowledged_at TEXT NOT NULL,
+    revoked_count INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS auth_target_configs (
     auth_ref TEXT PRIMARY KEY,
     login_url TEXT NOT NULL

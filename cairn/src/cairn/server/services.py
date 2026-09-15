@@ -252,6 +252,8 @@ def bootstrap_auth_deployment(
             "targets": target_configs if target_configs is not None else {},
         }
     )
+    if allow_environment_fallback:
+        _apply_legacy_credential_cutover(conn)
     if (
         not snapshot_present
         and auth_config is None
@@ -276,6 +278,35 @@ def bootstrap_auth_deployment(
     )
     if apply_targets:
         bootstrap_auth_target_configs(conn, snapshot.targets)
+
+
+def _apply_legacy_credential_cutover(conn: sqlite3.Connection) -> None:
+    """Honor the server-operator's one-time acknowledgement to revoke legacy rows.
+
+    Pre-ownership credentials are intentionally never inferred from actor/scope
+    metadata: custom helper deployments and manually provisioned credentials are
+    indistinguishable.  The acknowledgement is therefore an explicit, server-only
+    deployment control.  The audit row makes retries idempotent and observable.
+    """
+    if os.getenv("CAIRN_AUTH_LEGACY_CREDENTIAL_CUTOVER", "").strip().lower() != "revoke":
+        return
+    existing = conn.execute("SELECT id FROM auth_credential_cutovers WHERE id = 1").fetchone()
+    if existing is not None:
+        return
+    now = utcnow()
+    cursor = conn.execute(
+        """
+        UPDATE auth_credentials
+           SET expires_at = ?
+         WHERE deployment_owned = 0
+           AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (now, now),
+    )
+    conn.execute(
+        "INSERT INTO auth_credential_cutovers (id, acknowledged_at, revoked_count) VALUES (1, ?, ?)",
+        (now, cursor.rowcount),
+    )
 def _csv_env(name: str, default: str) -> list[str]:
     return sorted({item.strip() for item in os.getenv(name, default).split(",") if item.strip()})
 

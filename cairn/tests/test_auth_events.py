@@ -334,6 +334,36 @@ def test_deployment_snapshot_reconciles_omitted_credentials_and_preserves_manual
     assert manual is not None
 
 
+def test_acknowledged_legacy_cutover_revokes_unowned_custom_credentials(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(tmp_path / "legacy-cutover.db")
+    monkeypatch.setenv("CAIRN_AUTH_LEGACY_CREDENTIAL_CUTOVER", "revoke")
+    with db.get_conn() as conn:
+        provision_auth_credential(
+            conn,
+            "custom-legacy-token",
+            actor_id="desktop-helper-v1",
+            scopes={"helper.event.submit"},
+            project_allowlist={"*"},
+        )
+        bootstrap_auth_deployment(
+            conn,
+            dispatcher_token="dispatcher-token",
+        )
+        assert lookup_auth_credential(conn, "custom-legacy-token") is None
+        audit = conn.execute("SELECT * FROM auth_credential_cutovers").fetchall()
+        assert len(audit) == 1
+        assert audit[0]["revoked_count"] == 1
+
+        # Re-running with the acknowledgement still present is a no-op.
+        bootstrap_auth_deployment(
+            conn,
+            dispatcher_token="dispatcher-token",
+            allow_environment_fallback=False,
+        )
+        assert conn.execute("SELECT COUNT(*) FROM auth_credential_cutovers").fetchone()[0] == 1
+
+
 def test_deployment_credential_rotation_has_bounded_current_previous_overlap(
     tmp_path, monkeypatch
 ) -> None:

@@ -8,6 +8,12 @@ server: "http://cairn-server:8000"
 # digest in auth_credentials. Then set server_token below to the same opaque value.
 # There is intentionally no unauthenticated endpoint that creates the first credential;
 # without this Server-side seed the dispatcher's authenticated bootstrap call is denied.
+# Legacy credential cutover is deliberately opt-in and one-time. After inventorying
+# an upgraded database, set this Server-only environment variable to exactly
+# "revoke" and restart the Server; it revokes all still-unowned pre-migration
+# credentials (including custom helper actor/scope rows), records an audit row, and
+# is idempotent on later restarts. Leave it unset to preserve manual credentials.
+# CAIRN_AUTH_LEGACY_CREDENTIAL_CUTOVER: "revoke"
 # The Server may also consume a deployment snapshot built from this config. Its
 # dispatcher_token must equal server_token; helper_token is read from helper_token_env
 # and never committed.

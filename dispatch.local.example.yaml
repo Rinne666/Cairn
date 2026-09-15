@@ -22,6 +22,12 @@ server: "http://127.0.0.1:8000"
 # digest in auth_credentials. Then set server_token below to the same opaque value.
 # There is intentionally no unauthenticated endpoint that creates the first credential;
 # without this Server-side seed the dispatcher's authenticated bootstrap call is denied.
+# Legacy credential cutover is a one-time, explicit Server-only operation. After
+# inventorying the upgraded database, set CAIRN_AUTH_LEGACY_CREDENTIAL_CUTOVER to
+# exactly "revoke" and restart the Server to revoke all unowned pre-migration
+# credentials (including custom helper rows). The action is audited and idempotent;
+# leave it unset to preserve manual credentials.
+# CAIRN_AUTH_LEGACY_CREDENTIAL_CUTOVER: "revoke"
 # Build CAIRN_AUTH_DEPLOYMENT_SNAPSHOT from this config for the Server deployment;
 # dispatcher_token must equal server_token and target mappings come from auth.targets.
 # auth:
