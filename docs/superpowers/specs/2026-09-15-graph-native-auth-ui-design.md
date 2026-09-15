@@ -44,7 +44,7 @@ The existing Alpine/Cytoscape single-page frontend remains unchanged in technolo
 
 - Build Cytoscape elements from facts, intents, and active AuthRequests. An AuthRequest is a virtual `auth_required` node, connected from `source_fact_ids`, styled from existing amber/blue/red palettes according to `pending`, `claimed`, `waiting_user`, `verifying`, `failed`, `expired`, or `cancelled`.
 - Render AuthSessionVerified and AuthSessionInvalid as semantic Fact labels/details while preserving their normal Fact storage and graph edges.
-- Extend the existing Details tab with an Authentication section: target, role, source facts, safe reason, status, timestamps, verification methods, and status-appropriate Open Login / Retry / Cancel actions. No Cookie, token, storage path, raw state, or raw verifier error is rendered.
+- Extend the existing Details tab with an Authentication section: target, role, source facts, fixed `authentication_required` request summary, status, timestamps, allowlisted verification-method labels (`page`, `selector`, `http`), and status-appropriate Open Login / Retry / Cancel actions. No Cookie, token, storage path, raw state, raw reason, or raw verifier error is rendered.
 - Extend the existing Timeline projection with AuthRequest lifecycle events and add a compact project-level action-required indicator. Poll project plus project-scoped AuthRequests on the existing refresh cadence; completed virtual nodes disappear while the resulting Fact remains.
 - Add a metadata-only Authentication section to project settings, summarizing graph-derived `valid`, `invalid`, and `missing` states from AuthSession facts. It does not claim storage freshness, enumerate AuthStore files, or expose local-helper state.
 
