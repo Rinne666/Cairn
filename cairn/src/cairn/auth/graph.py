@@ -14,6 +14,7 @@ AUTH_OPERATOR = "operator.auth"
 # Fixed, stable shape of the AuthSessionVerified fact. Never contains secrets.
 FACT_VERIFIED = "AuthSessionVerified"
 FACT_INVALID = "AuthSessionInvalid"
+INVALID_REASON = "authentication check failed"
 
 
 class AuthGraphAdapter:
@@ -91,9 +92,10 @@ class AuthGraphAdapter:
 
     @staticmethod
     def _invalid_description(target: AuthTargetConfig, evidence: str) -> str:
+        LOG.warning("auth verification failed target=%s detail=%s", target.name, evidence)
         return (
             f"{FACT_INVALID}\n"
             f"target={target.name};\n"
             f"role={target.role};\n"
-            f"evidence={evidence}"
+            f"evidence={INVALID_REASON}"
         )

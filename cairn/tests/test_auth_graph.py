@@ -84,7 +84,23 @@ def test_invalid_fact_flow_records_evidence_without_secrets() -> None:
     assert FACT_INVALID in concluded
     assert "target=target-user" in concluded
     assert "role=user" in concluded
-    assert "evidence=protected endpoint redirected to login" in concluded
+    assert "evidence=authentication check failed" in concluded
+
+
+def test_invalid_fact_sanitizes_secret_bearing_verifier_error() -> None:
+    client = _RecordingClient()
+    adapter = AuthGraphAdapter(client)
+    secret = "super-secret-token"
+
+    adapter.invalid(
+        "proj_001",
+        _target(),
+        evidence=f"page navigation failed: https://target.example.com/login?token={secret}",
+    )
+
+    concluded = client.concluded[0][2]
+    assert secret not in concluded
+    assert "evidence=authentication check failed" in concluded
 
 
 def test_verified_fact_never_contains_secret_markers() -> None:

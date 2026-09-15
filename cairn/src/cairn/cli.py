@@ -130,7 +130,7 @@ def login(config_path: Path, project_id: str, target_name: str, request_id: str 
 @click.option("--target", "target_name", required=True, help="Auth target name (auth_ref)")
 def verify(config_path: Path, project_id: str, target_name: str):
     """Load an existing saved session state and re-verify it is still valid."""
-    from cairn.auth.graph import AuthGraphAdapter
+    from cairn.auth.graph import AuthGraphAdapter, INVALID_REASON
     from cairn.auth.models import AuthMeta, utcnow
     from cairn.auth.store import AuthStore
     from cairn.auth.verifier import AuthVerifier
@@ -162,7 +162,7 @@ def verify(config_path: Path, project_id: str, target_name: str):
             click.echo(f"[auth] AuthSessionVerified fact recorded (intent={intent_id})")
             click.echo(f"[auth] session valid target={target.name} role={target.role} verification={'+'.join(verification.methods())}")
         else:
-            evidence = verification.reason or "authentication check failed"
+            evidence = INVALID_REASON
             intent_id = adapter.invalid(project_id, target, evidence=evidence)
             click.echo(f"[auth] AuthSessionInvalid fact recorded (intent={intent_id})")
             click.echo(f"[auth] session invalid target={target.name} evidence={evidence}")
