@@ -695,6 +695,122 @@ AUTH_EVENT_CLAIM_SECONDS = 30
 AUTH_EVENT_MAX_ATTEMPTS = 3
 
 
+def ensure_auth_graph_outbox(
+    conn: sqlite3.Connection, event: sqlite3.Row, *, now: str | None = None
+) -> sqlite3.Row:
+    """Create the one durable graph effect for an auth verification event.
+
+    The event id is the idempotency boundary.  Stable source keys allow each graph
+    RPC to be retried independently after a process or network failure.
+    """
+    timestamp = now or utcnow()
+    effect_key = f"auth-event:{event['id']}"
+    intent_key = f"auth-event:{event['id']}:intent"
+    fact_key = f"auth-event:{event['id']}:fact"
+    conn.execute(
+        """
+        INSERT INTO auth_graph_outbox
+            (event_id, effect_key, project_id, request_id, auth_ref, intent_source_key,
+             fact_source_key, fact_kind, state, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'AuthSessionVerified', 'pending', ?, ?)
+        ON CONFLICT(event_id) DO NOTHING
+        """,
+        (event["id"], effect_key, event["project_id"], event["request_id"], event["auth_ref"],
+         intent_key, fact_key, timestamp, timestamp),
+    )
+    row = conn.execute("SELECT * FROM auth_graph_outbox WHERE event_id = ?", (event["id"],)).fetchone()
+    assert row is not None
+    return row
+
+
+def auth_graph_outbox_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return dict(row)
+
+
+def ack_auth_graph_outbox(
+    conn: sqlite3.Connection,
+    event_id: str,
+    dispatcher_id: str,
+    *,
+    state: str,
+    intent_id: str | None = None,
+    fact_id: str | None = None,
+    outcome_code: str | None = None,
+) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row]:
+    """Atomically publish graph progress and finish its owning auth event."""
+    outbox = conn.execute("SELECT * FROM auth_graph_outbox WHERE event_id = ?", (event_id,)).fetchone()
+    if outbox is None:
+        raise HTTPException(404, "Auth graph outbox entry not found")
+    event = conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone()
+    if event is None:
+        raise HTTPException(404, "Auth event not found")
+    request = get_auth_request_or_404(conn, event["request_id"])
+    if event["state"] in ("applied", "rejected"):
+        return event, request, outbox
+    if (
+        event["state"] != "claimed" or event["claimed_by"] != dispatcher_id
+    ):
+        raise HTTPException(409, "Auth event claim is not owned by dispatcher")
+    if state == "fact_created":
+        if not intent_id or not fact_id:
+            raise HTTPException(422, "fact_created acknowledgement requires graph ids")
+        if outbox["state"] not in {"fact_created", "intent_created"}:
+            raise HTTPException(409, "outbox is not ready for acknowledgement")
+        intent = conn.execute(
+            "SELECT id, source_key FROM intents WHERE project_id = ? AND id = ?",
+            (event["project_id"], intent_id),
+        ).fetchone()
+        fact = conn.execute(
+            "SELECT id, source_key FROM facts WHERE project_id = ? AND id = ?",
+            (event["project_id"], fact_id),
+        ).fetchone()
+        if (
+            intent is None or intent["source_key"] != outbox["intent_source_key"]
+            or fact is None or fact["source_key"] != outbox["fact_source_key"]
+        ):
+            raise HTTPException(409, "graph ids do not match auth outbox")
+        invalid_codes = {
+            "login_failed", "verification_failed", "store_unavailable",
+            "capture_mismatch", "unknown_target", "invalid_transition",
+        }
+        if outcome_code is not None and outcome_code not in invalid_codes and outcome_code != "verified":
+            raise HTTPException(422, "unsafe auth outcome")
+        now = utcnow()
+        conn.execute(
+            "UPDATE auth_graph_outbox SET state = 'fact_created', fact_kind = ?, intent_id = ?, fact_id = ?, outcome_code = ?, updated_at = ? WHERE event_id = ?",
+            ("AuthSessionInvalid" if outcome_code in invalid_codes else "AuthSessionVerified", intent_id, fact_id, outcome_code or "verified", now, event_id),
+        )
+        if outcome_code in invalid_codes:
+            conn.execute(
+                "UPDATE auth_events SET state = 'rejected', processed_at = ?, outcome_code = ?, claimed_by = NULL, claim_expires_at = NULL WHERE id = ? AND state = 'claimed' AND claimed_by = ?",
+                (now, outcome_code, event_id, dispatcher_id),
+            )
+            conn.execute(
+                "UPDATE auth_requests SET status = 'failed', completed_at = ?, failure_reason = ?, claimed_by = NULL, claimed_at = NULL, helper_actor_id = NULL WHERE id = ? AND status = 'verifying'",
+                (now, outcome_code, request["id"]),
+            )
+            _append_auth_lifecycle(conn, request["id"], event_id, "failed", outcome_code, recorded_at=now)
+        else:
+            conn.execute(
+                "UPDATE auth_events SET state = 'applied', processed_at = ?, outcome_code = 'verified', claimed_by = NULL, claim_expires_at = NULL WHERE id = ? AND state = 'claimed' AND claimed_by = ?",
+                (now, event_id, dispatcher_id),
+            )
+            conn.execute(
+                "UPDATE auth_requests SET status = 'completed', completed_at = ?, failure_reason = NULL, claimed_by = NULL, claimed_at = NULL, helper_actor_id = NULL WHERE id = ? AND status = 'verifying'",
+                (now, request["id"]),
+            )
+            _append_auth_lifecycle(conn, request["id"], event_id, "completed", "verified", recorded_at=now)
+    else:
+        # A graph outbox can only be acknowledged after its Fact exists.  Invalid
+        # outcomes still use state=fact_created with a fixed safe outcome code.
+        raise HTTPException(422, "outbox acknowledgement requires fact_created")
+    return (
+        conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone(),
+        conn.execute("SELECT * FROM auth_requests WHERE id = ?", (request["id"],)).fetchone(),
+        conn.execute("SELECT * FROM auth_graph_outbox WHERE event_id = ?", (event_id,)).fetchone(),
+    )
+
+
 def _append_auth_lifecycle(
     conn: sqlite3.Connection,
     request_id: str,
@@ -952,10 +1068,12 @@ def apply_auth_event_atomic(
         if status == "waiting_user":
             conn.execute("UPDATE auth_requests SET status = 'verifying' WHERE id = ?", (request["id"],))
             _append_auth_lifecycle(conn, request["id"], event_id, "verifying", "verifying", recorded_at=now)
-        # Verification is a Dispatcher/AuthStore concern deferred to the next
-        # phase. Keep both the claim and request in verifying for retry/recovery.
+        # The graph effect is durable before the Dispatcher opens the secret store.
+        # Keep both the event claim and request in verifying for crash recovery.
+        event_after = conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone()
+        ensure_auth_graph_outbox(conn, event_after, now=now)
         return (
-            conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone(),
+            event_after,
             conn.execute("SELECT * FROM auth_requests WHERE id = ?", (request["id"],)).fetchone(),
         )
     elif operation == "mark_failed":
@@ -963,10 +1081,16 @@ def apply_auth_event_atomic(
             raise HTTPException(409, "Dispatcher operation is not legal for auth request")
         outcome_code = outcome_code or "login_failed"
         conn.execute(
-            "UPDATE auth_requests SET status = 'failed', completed_at = ?, failure_reason = ? WHERE id = ?",
-            (now, outcome_code, request["id"]),
+            "UPDATE auth_requests SET status = 'verifying', failure_reason = NULL WHERE id = ?",
+            (request["id"],),
         )
-        _append_auth_lifecycle(conn, request["id"], event_id, "failed", outcome_code, recorded_at=now)
+        _append_auth_lifecycle(conn, request["id"], event_id, "verifying", outcome_code, recorded_at=now)
+        event_after = conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone()
+        ensure_auth_graph_outbox(conn, event_after, now=now)
+        return (
+            event_after,
+            conn.execute("SELECT * FROM auth_requests WHERE id = ?", (request["id"],)).fetchone(),
+        )
 
     conn.execute(
         "UPDATE auth_events SET state = 'applied', processed_at = ?, outcome_code = ?, claimed_by = NULL, claim_expires_at = NULL WHERE id = ?",
@@ -1340,6 +1464,118 @@ def _split_source_fact_ids(raw: str) -> list[str]:
 
 def _join_source_fact_ids(fact_ids: list[str]) -> str:
     return "\n".join(fact_ids)
+
+
+def create_auth_graph_intent(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    source_key: str,
+    source_fact_ids: list[str],
+    description: str,
+    creator: str = "operator.auth",
+    worker: str = "operator.auth",
+) -> dict[str, object]:
+    """Create or retrieve an auth intent by its durable source key."""
+    if not (source_key.startswith("auth:") or source_key.startswith("auth-event:")):
+        raise HTTPException(422, "auth graph source key is required")
+    check_project_active(conn, project_id)
+    validate_facts_exist(conn, project_id, source_fact_ids)
+    existing = conn.execute(
+        "SELECT * FROM intents WHERE project_id = ? AND source_key = ?",
+        (project_id, source_key),
+    ).fetchone()
+    if existing is not None:
+        existing_sources = [row["fact_id"] for row in conn.execute(
+            "SELECT fact_id FROM intent_sources WHERE intent_id = ? AND project_id = ? ORDER BY rowid",
+            (existing["id"], project_id),
+        ).fetchall()]
+        if existing["description"] != description or existing_sources != source_fact_ids:
+            raise HTTPException(409, "graph source key conflict")
+        model = intent_to_model(conn, existing, project_id).model_dump(by_alias=True)
+        model["source_key"] = source_key
+        conn.execute(
+            "UPDATE auth_graph_outbox SET state = CASE WHEN state = 'pending' THEN 'intent_created' ELSE state END, intent_id = COALESCE(intent_id, ?), updated_at = ? WHERE project_id = ? AND intent_source_key = ?",
+            (existing["id"], utcnow(), project_id, source_key),
+        )
+        return model
+    validate_intent_creator_worker(creator, worker)
+    now = utcnow()
+    intent_id = next_intent_id(conn, project_id)
+    conn.execute(
+        "INSERT INTO intents (id, project_id, to_fact_id, description, creator, worker, last_heartbeat_at, created_at, concluded_at, source_key) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?)",
+        (intent_id, project_id, description, creator, worker, now, now, source_key),
+    )
+    for fact_id in source_fact_ids:
+        conn.execute(
+            "INSERT INTO intent_sources (intent_id, project_id, fact_id) VALUES (?, ?, ?)",
+            (intent_id, project_id, fact_id),
+        )
+    row = conn.execute("SELECT * FROM intents WHERE id = ? AND project_id = ?", (intent_id, project_id)).fetchone()
+    model = intent_to_model(conn, row, project_id).model_dump(by_alias=True)
+    model["source_key"] = source_key
+    conn.execute(
+        "UPDATE auth_graph_outbox SET state = CASE WHEN state = 'pending' THEN 'intent_created' ELSE state END, intent_id = ?, updated_at = ? WHERE project_id = ? AND intent_source_key = ?",
+        (intent_id, now, project_id, source_key),
+    )
+    return model
+
+
+def conclude_auth_graph_intent(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    intent_source_key: str,
+    fact_source_key: str,
+    worker: str,
+    description: str,
+) -> dict[str, object]:
+    """Conclude a source-keyed auth intent exactly once."""
+    if not (intent_source_key.startswith("auth:") or intent_source_key.startswith("auth-event:")) or not (
+        fact_source_key.startswith("auth:") or fact_source_key.startswith("auth-event:")
+    ):
+        raise HTTPException(422, "auth graph source key is required")
+    check_project_active(conn, project_id)
+    intent = conn.execute(
+        "SELECT * FROM intents WHERE project_id = ? AND source_key = ?",
+        (project_id, intent_source_key),
+    ).fetchone()
+    if intent is None:
+        raise HTTPException(404, "Auth graph intent not found")
+    if intent["to_fact_id"] is not None:
+        fact = conn.execute(
+            "SELECT * FROM facts WHERE project_id = ? AND id = ?", (project_id, intent["to_fact_id"])
+        ).fetchone()
+        if fact is None or fact["source_key"] != fact_source_key:
+            raise HTTPException(409, "graph conclusion source key conflict")
+        result = {"intent_id": intent["id"], "fact_id": fact["id"], "fact": {"id": fact["id"], "description": fact["description"]}}
+        conn.execute(
+            "UPDATE auth_graph_outbox SET state = CASE WHEN state IN ('pending', 'intent_created') THEN 'fact_created' ELSE state END, intent_id = COALESCE(intent_id, ?), fact_id = COALESCE(fact_id, ?), updated_at = ? WHERE project_id = ? AND intent_source_key = ?",
+            (intent["id"], fact["id"], utcnow(), project_id, intent_source_key),
+        )
+        return result
+    existing_fact = conn.execute(
+        "SELECT * FROM facts WHERE project_id = ? AND source_key = ?", (project_id, fact_source_key)
+    ).fetchone()
+    now = utcnow()
+    if existing_fact is None:
+        fact_id = next_fact_id(conn, project_id)
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, source_key) VALUES (?, ?, ?, ?)",
+            (fact_id, project_id, description, fact_source_key),
+        )
+        existing_fact = conn.execute("SELECT * FROM facts WHERE id = ? AND project_id = ?", (fact_id, project_id)).fetchone()
+    elif existing_fact["description"] != description:
+        raise HTTPException(409, "graph source key conflict")
+    conn.execute(
+        "UPDATE intents SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ? WHERE id = ? AND project_id = ? AND to_fact_id IS NULL",
+        (existing_fact["id"], worker, now, now, intent["id"], project_id),
+    )
+    conn.execute(
+        "UPDATE auth_graph_outbox SET state = CASE WHEN state IN ('pending', 'intent_created') THEN 'fact_created' ELSE state END, intent_id = ?, fact_id = ?, updated_at = ? WHERE project_id = ? AND intent_source_key = ?",
+        (intent["id"], existing_fact["id"], now, project_id, intent_source_key),
+    )
+    return {"intent_id": intent["id"], "fact_id": existing_fact["id"], "fact": {"id": existing_fact["id"], "description": existing_fact["description"]}}
 
 
 def claim_auth_request_atomic(

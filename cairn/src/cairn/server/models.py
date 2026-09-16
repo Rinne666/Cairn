@@ -392,6 +392,7 @@ AuthEventOutcome = Literal[
     "expired",
     "store_unavailable",
     "capture_mismatch",
+    "unknown_target",
 ]
 
 
@@ -489,6 +490,93 @@ class AuthEvent(BaseModel):
     processed_at: str | None = None
     outcome_code: str | None = None
     capture_generation: int | None = None
+
+
+class AuthGraphIntentRequest(BaseModel):
+    """Dispatcher-only source-keyed graph intent mutation."""
+
+    model_config = {"extra": "forbid"}
+
+    project_id: str
+    source_key: str
+    source_fact_ids: list[str] = Field(min_length=1)
+    description: str
+    creator: str = "operator.auth"
+    worker: str = "operator.auth"
+
+    @field_validator("project_id", "source_key", "description", "creator", "worker")
+    @classmethod
+    def validate_graph_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("source_fact_ids")
+    @classmethod
+    def validate_graph_sources(cls, value: list[str]) -> list[str]:
+        values = [item.strip() for item in value]
+        if any(not item for item in values):
+            raise ValueError("source fact ids must not be empty")
+        return values
+
+
+class AuthGraphConcludeRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    project_id: str
+    intent_source_key: str
+    fact_source_key: str
+    worker: str = "operator.auth"
+    description: str
+
+    @field_validator("project_id", "intent_source_key", "fact_source_key", "worker", "description")
+    @classmethod
+    def validate_conclusion_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
+class AuthGraphOutboxAckRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    event_id: str
+    dispatcher_id: str = "dispatcher"
+    state: Literal["fact_created"]
+    intent_id: str | None = None
+    fact_id: str | None = None
+    outcome_code: AuthEventOutcome | None = None
+
+    @field_validator("event_id", "dispatcher_id", "intent_id", "fact_id")
+    @classmethod
+    def validate_ack_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
+class AuthGraphOutbox(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    event_id: str
+    effect_key: str
+    project_id: str
+    request_id: str
+    auth_ref: str
+    intent_source_key: str
+    fact_source_key: str
+    fact_kind: Literal["AuthSessionVerified", "AuthSessionInvalid"]
+    state: Literal["pending", "intent_created", "fact_created"]
+    intent_id: str | None = None
+    fact_id: str | None = None
+    outcome_code: str | None = None
+    created_at: str
+    updated_at: str
 
 
 class AuthHelperRequestView(BaseModel):

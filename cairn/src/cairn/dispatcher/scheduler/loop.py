@@ -46,7 +46,7 @@ class DispatcherLoop:
         self.config_path = config_path
         self.config = DispatchConfig.load(config_path)
         self.client = CairnClient(self.config.server, server_token=self.config.server_token)
-        self.auth_control = DispatcherAuthControl(self.client)
+        self.auth_control = DispatcherAuthControl(self.client, auth_config=self.config.auth)
         if self.config.runtime.execution == "local":
             self.container_manager = LocalBackend(self.config.local or LocalConfig(), self.config.auth)
         else:

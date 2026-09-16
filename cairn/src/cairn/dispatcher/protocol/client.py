@@ -116,6 +116,88 @@ class CairnClient:
     def expire_auth_requests(self) -> ApiResult:
         return self._request_json("POST", "/internal/auth/requests/expire", json={})
 
+    def create_auth_graph_intent(
+        self,
+        project_id: str,
+        source_key: str,
+        source_fact_ids: list[str],
+        description: str,
+        *,
+        creator: str = "operator.auth",
+        worker: str = "operator.auth",
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            "/internal/auth/graph/intents",
+            json={
+                "project_id": project_id,
+                "source_key": source_key,
+                "source_fact_ids": source_fact_ids,
+                "description": description,
+                "creator": creator,
+                "worker": worker,
+            },
+        )
+
+    # Descriptive aliases for callers that model this as a source-key lookup.
+    lookup_or_create_auth_intent = create_auth_graph_intent
+
+    def get_auth_graph_intent(self, project_id: str, source_key: str) -> ApiResult:
+        return self._request_json(
+            "GET", f"/internal/auth/graph/intents/{project_id}", json={"source_key": source_key}
+        )
+
+    def conclude_auth_graph_intent(
+        self,
+        project_id: str,
+        intent_source_key: str,
+        fact_source_key: str,
+        worker: str,
+        description: str,
+    ) -> ApiResult:
+        result = self._request_json(
+            "POST",
+            "/internal/auth/graph/conclude",
+            json={
+                "project_id": project_id,
+                "intent_source_key": intent_source_key,
+                "fact_source_key": fact_source_key,
+                "worker": worker,
+                "description": description,
+            },
+        )
+        if isinstance(result.data, dict):
+            fact = result.data.get("fact")
+            fact_id = result.data.get("fact_id") or (fact.get("id") if isinstance(fact, dict) else None)
+            if fact_id:
+                self._last_auth_graph_fact_id = str(fact_id)
+        return result
+
+    def acknowledge_auth_graph_outbox(
+        self,
+        event_id: str,
+        dispatcher_id: str,
+        *,
+        state: str,
+        intent_id: str | None = None,
+        fact_id: str | None = None,
+        outcome_code: str | None = None,
+    ) -> ApiResult:
+        body: dict[str, Any] = {
+            "event_id": event_id,
+            "dispatcher_id": dispatcher_id,
+            "state": state,
+        }
+        if intent_id is not None:
+            body["intent_id"] = intent_id
+        if fact_id is not None:
+            body["fact_id"] = fact_id
+        if outcome_code is not None:
+            body["outcome_code"] = outcome_code
+        return self._request_json("POST", "/internal/auth/graph/outbox/ack", json=body)
+
+    ack_auth_graph_outbox = acknowledge_auth_graph_outbox
+
     def export_project(self, project_id: str) -> str:
         response = self._session().get(
             self._url(f"/projects/{project_id}/export"),

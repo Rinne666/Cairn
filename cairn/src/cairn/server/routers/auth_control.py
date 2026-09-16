@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from cairn.server.db import get_conn
 from cairn.server.models import (
@@ -28,6 +28,16 @@ from cairn.server.services import (
     validate_facts_exist,
     _join_source_fact_ids,
     build_auth_state_resolver,
+    intent_to_model,
+    _split_source_fact_ids,
+    create_auth_graph_intent,
+    conclude_auth_graph_intent,
+    ack_auth_graph_outbox,
+)
+from cairn.server.models import (
+    AuthGraphIntentRequest,
+    AuthGraphConcludeRequest,
+    AuthGraphOutboxAckRequest,
 )
 
 router = APIRouter(tags=["auth-control"])
@@ -65,6 +75,9 @@ def claim_event(body: AuthEventClaimRequest, request: Request) -> dict[str, obje
             (row["request_id"],),
         ).fetchone()
         result["verification_event_id"] = verifying["event_id"] if verifying is not None else None
+        result["source_fact_ids"] = _split_source_fact_ids(auth_request["source_fact_ids"])
+        outbox = conn.execute("SELECT * FROM auth_graph_outbox WHERE event_id = ?", (row["id"],)).fetchone()
+        result["graph_outbox"] = dict(outbox) if outbox is not None else None
         return result
 
 
@@ -157,3 +170,73 @@ def create_request(body: CreateAuthRequestInternal, request: Request) -> AuthReq
         )
         _append_auth_lifecycle(conn, request_id, f"create:{request_id}", "created", "created", recorded_at=now)
         return auth_request_to_model(get_auth_request_or_404(conn, request_id))
+
+
+@router.post("/internal/auth/graph/intents", include_in_schema=False)
+@router.post("/internal/auth-graph/intents", include_in_schema=False)
+def create_graph_intent(body: AuthGraphIntentRequest, request: Request) -> dict[str, object]:
+    with get_conn() as conn:
+        principal = _dispatcher(request, conn)
+        if "*" not in principal.project_allowlist and body.project_id not in principal.project_allowlist:
+            raise HTTPException(403, "Forbidden")
+        return create_auth_graph_intent(
+            conn,
+            project_id=body.project_id,
+            source_key=body.source_key,
+            source_fact_ids=body.source_fact_ids,
+            description=body.description,
+            creator=body.creator,
+            worker=body.worker,
+        )
+
+
+@router.get("/internal/auth/graph/intents/{project_id}", include_in_schema=False)
+@router.get("/internal/auth-graph/intents/{project_id}", include_in_schema=False)
+def lookup_graph_intent(project_id: str, request: Request, source_key: str = Query(...)) -> dict[str, object]:
+    with get_conn() as conn:
+        principal = _dispatcher(request, conn)
+        if "*" not in principal.project_allowlist and project_id not in principal.project_allowlist:
+            raise HTTPException(403, "Forbidden")
+        row = conn.execute(
+            "SELECT * FROM intents WHERE project_id = ? AND source_key = ?", (project_id, source_key)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "Auth graph intent not found")
+        result = intent_to_model(conn, row, project_id).model_dump(by_alias=True)
+        result["source_key"] = source_key
+        return result
+
+
+@router.post("/internal/auth/graph/conclude", include_in_schema=False)
+@router.post("/internal/auth-graph/conclude", include_in_schema=False)
+def conclude_graph_intent(body: AuthGraphConcludeRequest, request: Request) -> dict[str, object]:
+    with get_conn() as conn:
+        principal = _dispatcher(request, conn)
+        if "*" not in principal.project_allowlist and body.project_id not in principal.project_allowlist:
+            raise HTTPException(403, "Forbidden")
+        return conclude_auth_graph_intent(
+            conn,
+            project_id=body.project_id,
+            intent_source_key=body.intent_source_key,
+            fact_source_key=body.fact_source_key,
+            worker=body.worker,
+            description=body.description,
+        )
+
+
+@router.post("/internal/auth/graph/outbox/ack", include_in_schema=False)
+@router.post("/internal/auth-graph/outbox/ack", include_in_schema=False)
+def acknowledge_graph_outbox(body: AuthGraphOutboxAckRequest, request: Request) -> dict[str, object]:
+    with get_conn() as conn:
+        principal = _dispatcher(request, conn)
+        event = conn.execute("SELECT project_id FROM auth_events WHERE id = ?", (body.event_id,)).fetchone()
+        if event is None:
+            raise HTTPException(404, "Auth event not found")
+        if "*" not in principal.project_allowlist and event["project_id"] not in principal.project_allowlist:
+            raise HTTPException(403, "Forbidden")
+        event_row, request_row, outbox = ack_auth_graph_outbox(
+            conn, body.event_id, body.dispatcher_id, state=body.state,
+            intent_id=body.intent_id, fact_id=body.fact_id,
+            outcome_code=body.outcome_code,
+        )
+        return {"event": dict(event_row), "request": auth_request_to_model(request_row).model_dump(mode="json"), "outbox": dict(outbox)}

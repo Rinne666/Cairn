@@ -583,6 +583,220 @@ def test_internal_create_rejects_worker_supplied_authority_fields(client: TestCl
     assert response.json()["reason"] == "authentication_required"
 
 
+def test_auth_graph_outbox_and_source_keys_are_durable(client: TestClient) -> None:
+    with db.get_conn() as conn:
+        outbox = conn.execute("PRAGMA table_info(auth_graph_outbox)").fetchall()
+        intents = {row["name"] for row in conn.execute("PRAGMA table_info(intents)")}
+        facts = {row["name"] for row in conn.execute("PRAGMA table_info(facts)")}
+    assert outbox
+    assert {row["name"] for row in outbox} >= {
+        "event_id", "effect_key", "project_id", "request_id", "intent_source_key", "fact_source_key", "fact_kind", "state"
+    }
+    assert "source_key" in intents
+    assert "source_key" in facts
+
+
+def test_graph_source_key_rpc_is_dispatcher_only(client: TestClient) -> None:
+    body = {
+        "project_id": "p1",
+        "source_key": "auth:event:e1:intent",
+        "source_fact_ids": ["origin"],
+        "description": "Verify authenticated session",
+    }
+    denied = client.post(
+        "/internal/auth/graph/intents", json=body,
+        headers={"Authorization": "Bearer helper-token", "X-Forwarded-Proto": "https"},
+    )
+    assert denied.status_code in (401, 403)
+    allowed = client.post("/internal/auth/graph/intents", json=body, headers=_headers())
+    assert allowed.status_code == 200
+    assert allowed.json()["source_key"] == body["source_key"]
+
+
+def test_login_success_control_validates_manifest_before_graph_effect() -> None:
+    class Store:
+        def validate_capture(self, *args, **kwargs):
+            raise ValueError("capture mismatch")
+
+    class Client:
+        def claim_auth_event(self, dispatcher_id: str) -> ApiResult:
+            return ApiResult(200, data={
+                "id": "event-1", "kind": "login_succeeded", "actor_id": "helper-a",
+                "request_status": "waiting_user", "helper_actor_id": "helper-a",
+                "project_id": "p1", "request_id": "r1", "auth_ref": "target",
+                "capture_generation": 1,
+            })
+
+        def apply_auth_event(self, event_id: str, dispatcher_id: str, **kwargs: str) -> ApiResult:
+            assert kwargs["operation"] == "begin_verification"
+            return ApiResult(200, data={"state": "claimed", "status": "verifying"})
+
+        def create_auth_graph_intent(self, *args, **kwargs):
+            return ApiResult(200, data={"id": "i-invalid"})
+
+        def conclude_auth_graph_intent(self, *args, **kwargs):
+            return ApiResult(200, data={"intent_id": "i-invalid", "fact_id": "f-invalid"})
+
+        def acknowledge_auth_graph_outbox(self, *args, **kwargs):
+            return ApiResult(200, data={})
+
+    control = DispatcherAuthControl(Client(), auth_store=Store())
+    result = control.consume_once()
+    assert result is not None and result.ok
+
+
+def test_login_success_control_replays_graph_effects_by_event_source_keys() -> None:
+    from cairn.auth.models import AuthVerificationResult
+    from cairn.dispatcher.config import AuthTargetConfig
+
+    target = AuthTargetConfig.model_validate({
+        "name": "target", "base_url": "https://target.example", "login_url": "https://target.example/login",
+        "role": "user", "verify": {"url": "https://target.example/private"},
+    })
+
+    class Store:
+        def validate_capture(self, *args, **kwargs):
+            return object()
+
+        def load_state(self, *args):
+            return {"cookies": []}
+
+    class Config:
+        verify_timeout = 30
+
+        @staticmethod
+        def target(name):
+            assert name == "target"
+            return target
+
+    class Verifier:
+        def verify_storage_state(self, _target, _state):
+            return AuthVerificationResult(True, True, True, True)
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def claim_auth_event(self, dispatcher_id):
+            return ApiResult(200, data={
+                "id": "event-2", "kind": "login_succeeded", "actor_id": "helper-a",
+                "request_status": "waiting_user", "helper_actor_id": "helper-a",
+                "project_id": "p1", "request_id": "r1", "auth_ref": "target",
+                "capture_generation": 1, "source_fact_ids": ["origin"],
+            })
+
+        def apply_auth_event(self, event_id, dispatcher_id, **kwargs):
+            self.calls.append(("apply", kwargs))
+            return ApiResult(200, data={"state": "claimed", "status": "verifying"})
+
+        def create_auth_graph_intent(self, *args, **kwargs):
+            self.calls.append(("intent", args, kwargs))
+            return ApiResult(200, data={"id": "i-auth"})
+
+        def conclude_auth_graph_intent(self, *args, **kwargs):
+            self.calls.append(("conclude", args, kwargs))
+            return ApiResult(200, data={"intent_id": "i-auth", "fact_id": "f-auth"})
+
+        def acknowledge_auth_graph_outbox(self, *args, **kwargs):
+            self.calls.append(("ack", args, kwargs))
+            return ApiResult(200, data={})
+
+    client = Client()
+    result = DispatcherAuthControl(client, auth_store=Store(), auth_config=Config(), verifier=Verifier()).consume_once()
+    assert result is not None and result.ok
+    assert [call[0] for call in client.calls] == ["apply", "intent", "conclude", "ack"]
+    assert client.calls[-1][2]["state"] == "fact_created"
+
+
+def test_login_failed_control_publishes_one_sanitized_invalid_fact() -> None:
+    from cairn.auth.models import AuthVerificationResult
+
+    class Target:
+        name = "target"
+        role = "user"
+        base_url = "https://target.example"
+
+    class Config:
+        helper_actor_id = "helper-a"
+
+        @staticmethod
+        def target(name):
+            return Target()
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def claim_auth_event(self, dispatcher_id):
+            return ApiResult(200, data={
+                "id": "event-fail", "kind": "login_failed", "actor_id": "helper-a",
+                "request_status": "waiting_user", "helper_actor_id": "helper-a",
+                "project_id": "p1", "request_id": "r1", "auth_ref": "target",
+                "source_fact_ids": ["origin"],
+            })
+
+        def apply_auth_event(self, event_id, dispatcher_id, **kwargs):
+            self.calls.append(("apply", kwargs))
+            return ApiResult(200, data={"state": "claimed", "status": "verifying"})
+
+        def create_auth_graph_intent(self, *args, **kwargs):
+            self.calls.append(("intent", args, kwargs))
+            return ApiResult(200, data={"id": "i-invalid"})
+
+        def conclude_auth_graph_intent(self, *args, **kwargs):
+            self.calls.append(("conclude", args, kwargs))
+            return ApiResult(200, data={"intent_id": "i-invalid", "fact_id": "f-invalid"})
+
+        def acknowledge_auth_graph_outbox(self, *args, **kwargs):
+            self.calls.append(("ack", args, kwargs))
+            return ApiResult(200, data={})
+
+    client = Client()
+    result = DispatcherAuthControl(client, auth_config=Config(), verifier=object(), auth_store=object()).consume_once()
+    assert result is not None and result.ok
+    assert [call[0] for call in client.calls] == ["apply", "intent", "conclude", "ack"]
+    assert client.calls[-1][2] == {
+        "state": "fact_created", "intent_id": "i-invalid", "fact_id": "f-invalid",
+        "outcome_code": "login_failed",
+    }
+
+
+def test_invalid_graph_ack_fails_request_without_marking_it_verified(client: TestClient) -> None:
+    with db.get_conn() as conn:
+        conn.execute("UPDATE auth_requests SET status = 'verifying', helper_actor_id = 'helper-a' WHERE id = 'r1'")
+        conn.execute(
+            "INSERT INTO auth_events (id, project_id, request_id, auth_ref, kind, actor_id, idempotency_key, occurred_at, received_at, state, claimed_by, claim_expires_at) VALUES ('e-invalid', 'p1', 'r1', 'target', 'login_failed', 'helper-a', ?, ?, ?, 'claimed', 'd1', ?)",
+            (str(uuid4()), _ts(), _ts(), _ts(-60)),
+        )
+        from cairn.server.services import ensure_auth_graph_outbox
+        ensure_auth_graph_outbox(conn, conn.execute("SELECT * FROM auth_events WHERE id = 'e-invalid'").fetchone())
+    intent_key = "auth-event:e-invalid:intent"
+    fact_key = "auth-event:e-invalid:fact"
+    created = client.post("/internal/auth/graph/intents", json={
+        "project_id": "p1", "source_key": intent_key, "source_fact_ids": ["origin"],
+        "description": "Verify authenticated session",
+    }, headers=_headers())
+    assert created.status_code == 200
+    concluded = client.post("/internal/auth/graph/conclude", json={
+        "project_id": "p1", "intent_source_key": intent_key, "fact_source_key": fact_key,
+        "description": "AuthSessionInvalid\ntarget=target;\nrole=user;\nevidence=authentication check failed",
+    }, headers=_headers())
+    assert concluded.status_code == 200
+    acknowledged = client.post("/internal/auth/graph/outbox/ack", json={
+        "event_id": "e-invalid", "dispatcher_id": "d1", "state": "fact_created",
+        "intent_id": concluded.json()["intent_id"], "fact_id": concluded.json()["fact_id"],
+        "outcome_code": "login_failed",
+    }, headers=_headers())
+    assert acknowledged.status_code == 200
+    with db.get_conn() as conn:
+        event = conn.execute("SELECT state, outcome_code FROM auth_events WHERE id = 'e-invalid'").fetchone()
+        request = conn.execute("SELECT status, failure_reason FROM auth_requests WHERE id = 'r1'").fetchone()
+        outbox = conn.execute("SELECT state, outcome_code FROM auth_graph_outbox WHERE event_id = 'e-invalid'").fetchone()
+    assert dict(event) == {"state": "rejected", "outcome_code": "login_failed"}
+    assert dict(request) == {"status": "failed", "failure_reason": "login_failed"}
+    assert dict(outbox) == {"state": "fact_created", "outcome_code": "login_failed"}
+
+
 def test_dispatch_config_accepts_control_plane_mode_and_zero_ttl() -> None:
     from cairn.dispatcher.config import DispatchConfig
 

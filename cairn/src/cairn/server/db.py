@@ -38,8 +38,12 @@ CREATE TABLE IF NOT EXISTS facts (
     id TEXT NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     description TEXT NOT NULL,
+    source_key TEXT,
     PRIMARY KEY (id, project_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_facts_source_key
+    ON facts (project_id, source_key) WHERE source_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS intents (
     id TEXT NOT NULL,
@@ -51,8 +55,12 @@ CREATE TABLE IF NOT EXISTS intents (
     last_heartbeat_at TEXT,
     created_at TEXT NOT NULL,
     concluded_at TEXT,
+    source_key TEXT,
     PRIMARY KEY (id, project_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_intents_source_key
+    ON intents (project_id, source_key) WHERE source_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS intent_sources (
     intent_id TEXT NOT NULL,
@@ -172,6 +180,26 @@ CREATE TABLE IF NOT EXISTS auth_target_metadata (
     role TEXT NOT NULL,
     request_reason TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS auth_graph_outbox (
+    event_id TEXT PRIMARY KEY REFERENCES auth_events(id) ON DELETE CASCADE,
+    effect_key TEXT NOT NULL UNIQUE,
+    project_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    auth_ref TEXT NOT NULL,
+    intent_source_key TEXT NOT NULL UNIQUE,
+    fact_source_key TEXT NOT NULL UNIQUE,
+    fact_kind TEXT NOT NULL CHECK (fact_kind IN ('AuthSessionVerified', 'AuthSessionInvalid')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'intent_created', 'fact_created')),
+    intent_id TEXT,
+    fact_id TEXT,
+    outcome_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_graph_outbox_pending
+    ON auth_graph_outbox (state, updated_at);
 """
 
 
@@ -188,6 +216,7 @@ def configure(path: Path) -> None:
         _ensure_auth_request_columns(conn)
         _ensure_auth_credential_columns(conn)
         _ensure_auth_schema(conn)
+        _ensure_graph_columns(conn)
         from cairn.server.services import bootstrap_auth_deployment
 
         bootstrap_auth_deployment(conn)
@@ -344,6 +373,54 @@ def _ensure_auth_schema(conn: sqlite3.Connection) -> None:
                     row["status"],
                 ),
             )
+
+
+def _ensure_graph_columns(conn: sqlite3.Connection) -> None:
+    """Add source-key graph identity and the durable auth graph outbox."""
+    fact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(facts)")}
+    if "source_key" not in fact_columns:
+        conn.execute("ALTER TABLE facts ADD COLUMN source_key TEXT")
+    intent_columns = {row["name"] for row in conn.execute("PRAGMA table_info(intents)")}
+    if "source_key" not in intent_columns:
+        conn.execute("ALTER TABLE intents ADD COLUMN source_key TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_facts_source_key ON facts (project_id, source_key) WHERE source_key IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_intents_source_key ON intents (project_id, source_key) WHERE source_key IS NOT NULL"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_graph_outbox (
+            event_id TEXT PRIMARY KEY REFERENCES auth_events(id) ON DELETE CASCADE,
+            effect_key TEXT NOT NULL UNIQUE,
+            project_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            auth_ref TEXT NOT NULL,
+            intent_source_key TEXT NOT NULL UNIQUE,
+            fact_source_key TEXT NOT NULL UNIQUE,
+            fact_kind TEXT NOT NULL DEFAULT 'AuthSessionVerified' CHECK (fact_kind IN ('AuthSessionVerified', 'AuthSessionInvalid')),
+            state TEXT NOT NULL CHECK (state IN ('pending', 'intent_created', 'fact_created')),
+            intent_id TEXT,
+            fact_id TEXT,
+            outcome_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(auth_graph_outbox)")}
+    if "effect_key" not in outbox_columns:
+        conn.execute("ALTER TABLE auth_graph_outbox ADD COLUMN effect_key TEXT")
+        conn.execute(
+            "UPDATE auth_graph_outbox SET effect_key = 'auth-event:' || event_id WHERE effect_key IS NULL"
+        )
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_auth_graph_effect_key ON auth_graph_outbox (effect_key)")
+    if "fact_kind" not in outbox_columns:
+        conn.execute("ALTER TABLE auth_graph_outbox ADD COLUMN fact_kind TEXT NOT NULL DEFAULT 'AuthSessionVerified'")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_graph_outbox_pending ON auth_graph_outbox (state, updated_at)"
+    )
 
 
 @contextmanager
