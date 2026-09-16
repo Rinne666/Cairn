@@ -97,6 +97,24 @@ def test_event_ingress_is_idempotent_per_actor_and_rejects_conflict(client: Test
     assert conflict.status_code == 409
 
 
+def test_event_retry_from_new_process_ignores_occurred_at_for_idempotency(client: TestClient) -> None:
+    key = str(uuid4())
+    payload = _event(idempotency_key=key, occurred_at="2026-01-01T00:00:00Z")
+    first = client.post("/auth-events", json=payload, headers=_headers(proto="https"))
+    assert first.status_code == 201
+
+    # A restarted Helper has no in-memory timestamp cache and may submit a new
+    # display timestamp. The durable idempotency key still identifies the event.
+    with TestClient(app, base_url="https://testserver") as restarted_client:
+        retry = restarted_client.post(
+            "/auth-events",
+            json={**payload, "occurred_at": "2026-01-01T00:01:00Z"},
+            headers=_headers(proto="https"),
+        )
+    assert retry.status_code == 200
+    assert retry.json() == first.json()
+
+
 def test_helper_view_is_scoped_and_redacts_legacy_fields(client: TestClient) -> None:
     pending = client.get(
         "/projects/proj_001/auth-requests/helper-pending", headers=_headers(proto="https")
@@ -111,6 +129,31 @@ def test_helper_view_is_scoped_and_redacts_legacy_fields(client: TestClient) -> 
     )
     assert view.status_code == 200
     assert set(view.json()) == {"id", "auth_ref", "login_url", "status"}
+
+
+def test_claimed_helper_view_is_visible_only_to_bound_actor(client: TestClient) -> None:
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE auth_requests SET status = 'claimed', helper_actor_id = 'helper-a' WHERE id = 'auth_001'"
+        )
+        provision_auth_credential(
+            conn,
+            "other-helper-token",
+            actor_id="helper-b",
+            scopes={"helper.request.read"},
+            project_allowlist={"proj_001"},
+        )
+
+    owner = client.get(
+        "/projects/proj_001/auth-requests/auth_001/helper-view", headers=_headers("helper-token", proto="https")
+    )
+    assert owner.status_code == 200
+    assert owner.json()["helper_actor_id"] == "helper-a"
+
+    other = client.get(
+        "/projects/proj_001/auth-requests/auth_001/helper-view", headers=_headers("other-helper-token", proto="https")
+    )
+    assert other.status_code == 404
 
 
 def test_legacy_helper_listing_remains_available_until_helper_event_migration(client: TestClient) -> None:

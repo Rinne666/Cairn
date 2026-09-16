@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import platform
 
-from cairn.server.models import AuthRequest
+from cairn.auth_helper.client import AuthHelperRequest
 
 LOG = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ class DesktopNotifier:
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
 
-    def notify_auth_required(self, request: AuthRequest) -> None:
+    def notify_auth_required(self, request: AuthHelperRequest) -> None:
         message = self._format(request)
         LOG.info("auth notification: %s", message.replace("\n", " | "))
         if not self.enabled:
@@ -26,14 +26,12 @@ class DesktopNotifier:
         self._emit(message)
 
     @staticmethod
-    def _format(request: AuthRequest) -> str:
+    def _format(request: AuthHelperRequest) -> str:
         lines = [
             "Cairn requires authentication",
             "",
             f"Project: {request.project_id}",
             f"Target: {request.auth_ref}",
-            f"Role: {request.role}",
-            f"Reason: {request.reason}",
         ]
         return "\n".join(lines)
 

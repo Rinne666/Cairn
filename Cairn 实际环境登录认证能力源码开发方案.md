@@ -52,7 +52,9 @@ Reason
 1. Reason 根据 Graph 判断认证是否为当前探索的实际前置条件。
 2. 没有有效 `AuthSessionVerified` 时，Reason 输出 `interventions` 中的 `type=auth` 项；不创建“让 Agent 自己登录”的普通 Intent。
 3. Dispatcher 以 `(project_id, auth_ref)` 创建或复用一个 AuthRequest。若已有有效会话或活跃请求，Server 拒绝重复请求。
-4. 桌面运行的 `cairn auth-helper` 轮询 `GET /auth-requests?status=pending`，通过原子 claim 抢占请求。
+4. 桌面运行的 `cairn auth-helper --project <project_id>` 通过项目作用域的
+   Helper 视图轮询 pending 请求，并发送 `launch_requested` 事件；Dispatcher 消费事件后
+   才绑定 Helper actor 并完成 claim，不使用全局请求列表或 Helper 直接状态写入。
 5. Helper 发送桌面通知，并在 `auto_launch` 开启时启动：
 
    ```text
@@ -147,9 +149,12 @@ uv run --project cairn cairn serve
 uv run --project cairn cairn dispatch --config dispatch.yaml
 
 # 在操作员桌面启动自动提醒/弹窗 Helper
+# 先在该桌面进程环境设置 CAIRN_AUTH_HELPER_TOKEN；--token-env 默认读取此变量。
 uv run --project cairn cairn auth-helper \
   --server http://localhost:8000 \
   --config dispatch.yaml \
+  --project proj_001 \
+  --token-env CAIRN_AUTH_HELPER_TOKEN \
   --auto-launch
 
 # 手动登录并保存认证态

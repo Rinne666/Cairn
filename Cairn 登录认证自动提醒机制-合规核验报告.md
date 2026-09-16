@@ -52,7 +52,7 @@
 | 文档要求 | 实现 | 状态 |
 |---------|------|------|
 | `cairn auth-helper` 后台进程 | `cli.py` 新增 `auth-helper` 命令 | ✅ |
-| 轮询 pending + claim + notify + launch | `AuthHelperDaemon.run_once` 完整实现 | ✅ |
+| 按项目作用域轮询 pending，通过事件 claim，再 notify + launch | `AuthHelperDaemon.run_once` 完整实现 | ✅ |
 | helper_id = hostname+username | `default_helper_id()` | ✅ |
 | 桌面通知 | `DesktopNotifier`（Win PowerShell / macOS osascript / Linux notify-send） | ✅ |
 | 自动弹窗（auto_launch） | `launcher.launch` 子进程调 `cairn auth login`（headed Chromium 即主弹窗） | ✅ |

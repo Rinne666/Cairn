@@ -31,38 +31,52 @@ def auth():
 @click.option("--request", "request_id", required=False, help="Auth request id to drive (auth_007)")
 def login(config_path: Path, project_id: str, target_name: str, request_id: str | None):
     """Open a headed browser for the operator to log in, then save the session state."""
-    from cairn.auth.graph import AuthGraphAdapter
     from cairn.auth.manager import AuthManager
     from cairn.auth.models import AuthMeta, utcnow
     from cairn.auth.store import AuthStore
     from cairn.auth.verifier import AuthVerifier
     from cairn.dispatcher.config import DispatchConfig
+    from cairn.auth_helper.client import AuthHelperClient
     from cairn.dispatcher.protocol.client import CairnClient
+    import os
 
     config = DispatchConfig.load(config_path)
     if config.auth is None:
         raise click.ClickException("dispatch config has no 'auth' section")
+    if request_id is not None and getattr(config, "auth_control_plane_mode", None) == "legacy":
+        raise click.ClickException(
+            "request-bound auth login requires auth_control_plane_mode=dual_write or enforced"
+        )
     try:
         target = config.auth.target(target_name)
     except KeyError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    client = CairnClient(config.server)
+    event_client: AuthHelperClient | None = None
+    if request_id is not None:
+        token = os.environ.get(config.auth.helper_token_env)
+        event_client = AuthHelperClient(CairnClient(config.server, server_token=token))
 
-    def _drive_request(method: str) -> None:
-        """Advance the auth-request state machine (best effort)."""
-        if request_id is None:
-            return
-        try:
-            getattr(client, method)(request_id)
-        finally:
-            return
+    def _submit(kind: str, capture_generation: int | None = None) -> bool:
+        if event_client is None or request_id is None:
+            return True
+        return event_client.submit_event_fields(
+            project_id,
+            request_id,
+            target.name,
+            kind,
+            capture_generation=capture_generation,
+        )
 
     try:
-        # Claimed -> waiting_user as the operator is about to see the login window.
-        if request_id is not None:
-            _drive_request("auth_request_waiting")
-
+        if request_id is not None and not event_client.wait_until_claimed_fields(
+            project_id,
+            request_id,
+            actor_id=getattr(config.auth, "helper_actor_id", None),
+        ):
+            raise click.ClickException("dispatcher did not claim auth request")
+        if request_id is not None and not _submit("browser_opened"):
+            raise click.ClickException("failed to submit browser_opened event")
         store = AuthStore(Path(config.auth.store_root))
         manager = AuthManager()
         result = manager.capture_interactive(
@@ -72,23 +86,24 @@ def login(config_path: Path, project_id: str, target_name: str, request_id: str 
             on_status=lambda msg: click.echo(f"[auth] {msg}"),
         )
         if result.storage_state is None:
-            if request_id is not None:
-                _drive_request("auth_request_fail")
+            _submit("login_failed")
             raise click.ClickException("login did not produce a verified session")
 
         # Re-verify the freshly saved state independently before trusting it.
-        state_path = store.write_state(project_id, target.name, result.storage_state)
-        click.echo(f"[auth] saved storage state: {state_path}")
-
-        if request_id is not None:
-            _drive_request("auth_request_verifying")
-
         verifier = AuthVerifier(timeout_ms=config.auth.verify_timeout * 1000)
         verification = verifier.verify_storage_state(target, result.storage_state)
         if not verification.valid:
-            if request_id is not None:
-                _drive_request("auth_request_fail")
+            _submit("login_failed")
             raise click.ClickException(f"re-verification failed: {verification.reason}")
+        manifest = store.write_capture(
+            project_id,
+            target.name,
+            result.storage_state,
+            request_id=request_id or "local",
+            actor_id=getattr(config.auth, "helper_actor_id", "local"),
+        )
+        state_path = store.state_file(project_id, target.name)
+        click.echo(f"[auth] saved storage state: {state_path}")
 
         store.write_meta(
             project_id,
@@ -107,15 +122,14 @@ def login(config_path: Path, project_id: str, target_name: str, request_id: str 
             ),
         )
 
-        # Publish the verified-session Fact via the normal Intent -> conclude protocol.
-        adapter = AuthGraphAdapter(client)
-        intent_id = adapter.verified(project_id, target, methods=verification.methods())
         if request_id is not None:
-            _drive_request("auth_request_complete")
-        click.echo(f"[auth] AuthSessionVerified fact recorded (intent={intent_id})")
+            if not _submit("login_succeeded", manifest.capture_generation):
+                raise click.ClickException("failed to submit login_succeeded event")
+        click.echo("[auth] authenticated session captured locally")
         click.echo(f"[auth] target={target.name} role={target.role} verification={'+'.join(verification.methods())}")
     finally:
-        client.close()
+        if event_client is not None:
+            event_client.client.close()
 
 
 @auth.command()
@@ -128,18 +142,24 @@ def login(config_path: Path, project_id: str, target_name: str, request_id: str 
 )
 @click.option("--project", "project_id", required=True, help="Project id (e.g. proj_001)")
 @click.option("--target", "target_name", required=True, help="Auth target name (auth_ref)")
-def verify(config_path: Path, project_id: str, target_name: str):
+@click.option("--request", "request_id", required=False, help="Auth request id to drive (auth_007)")
+def verify(config_path: Path, project_id: str, target_name: str, request_id: str | None):
     """Load an existing saved session state and re-verify it is still valid."""
-    from cairn.auth.graph import AuthGraphAdapter, INVALID_REASON
     from cairn.auth.models import AuthMeta, utcnow
     from cairn.auth.store import AuthStore
     from cairn.auth.verifier import AuthVerifier
+    from cairn.auth_helper.client import AuthHelperClient
     from cairn.dispatcher.config import DispatchConfig
     from cairn.dispatcher.protocol.client import CairnClient
+    import os
 
     config = DispatchConfig.load(config_path)
     if config.auth is None:
         raise click.ClickException("dispatch config has no 'auth' section")
+    if request_id is not None and getattr(config, "auth_control_plane_mode", None) == "legacy":
+        raise click.ClickException(
+            "request-bound auth verify requires auth_control_plane_mode=dual_write or enforced"
+        )
     try:
         target = config.auth.target(target_name)
     except KeyError as exc:
@@ -151,23 +171,44 @@ def verify(config_path: Path, project_id: str, target_name: str):
     except FileNotFoundError as exc:
         raise click.ClickException(str(exc)) from exc
 
+    capture_manifest = None
+    if request_id is not None:
+        actor_id = getattr(config.auth, "helper_actor_id", "helper")
+        try:
+            capture_manifest = store.load_manifest(project_id, target.name)
+            store.validate_capture(
+                project_id,
+                target.name,
+                request_id=request_id,
+                actor_id=actor_id,
+                capture_generation=capture_manifest.capture_generation,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise click.ClickException(f"capture validation failed: {exc}") from exc
+
     verifier = AuthVerifier(timeout_ms=config.auth.verify_timeout * 1000)
     verification = verifier.verify_storage_state(target, storage_state)
 
-    client = CairnClient(config.server)
-    try:
-        adapter = AuthGraphAdapter(client)
-        if verification.valid:
-            intent_id = adapter.verified(project_id, target, methods=verification.methods())
-            click.echo(f"[auth] AuthSessionVerified fact recorded (intent={intent_id})")
-            click.echo(f"[auth] session valid target={target.name} role={target.role} verification={'+'.join(verification.methods())}")
-        else:
-            evidence = INVALID_REASON
-            intent_id = adapter.invalid(project_id, target, evidence=evidence)
-            click.echo(f"[auth] AuthSessionInvalid fact recorded (intent={intent_id})")
-            click.echo(f"[auth] session invalid target={target.name} evidence={evidence}")
-    finally:
-        client.close()
+    event_client: AuthHelperClient | None = None
+    if request_id is not None:
+        token = os.environ.get(config.auth.helper_token_env)
+        event_client = AuthHelperClient(CairnClient(config.server, server_token=token))
+        try:
+            if not event_client.wait_until_verifiable_fields(
+                project_id, request_id, actor_id=actor_id,
+            ):
+                raise click.ClickException("dispatcher did not claim auth request")
+            kind = "login_succeeded" if verification.valid else "login_failed"
+            if not event_client.submit_event_fields(
+                project_id,
+                request_id,
+                target.name,
+                kind,
+                capture_generation=capture_manifest.capture_generation if verification.valid else None,
+            ):
+                raise click.ClickException(f"failed to submit {kind} event")
+        finally:
+            event_client.client.close()
 
     # Refresh meta with the latest verification outcome.
     try:
@@ -186,6 +227,10 @@ def verify(config_path: Path, project_id: str, target_name: str):
         "api": verification.api_ok,
     }
     store.write_meta(project_id, target.name, meta)
+    if verification.valid:
+        click.echo(f"[auth] session valid target={target.name} role={target.role} verification={'+'.join(verification.methods())}")
+    else:
+        click.echo(f"[auth] session invalid target={target.name}")
 
 
 @auth.command()
@@ -309,6 +354,7 @@ def dispatch(config_path: Path, once: bool, startup_healthcheck_only: bool, log_
     required=True,
     help="Dispatcher config path (contains the auth targets)",
 )
+@click.option("--project", "project_id", required=True, help="Project scope for Helper request discovery")
 @click.option("--helper-name", "helper_id", default=None, help="Helper identifier (default hostname-username)")
 @click.option("--token-env", default="CAIRN_AUTH_HELPER_TOKEN", show_default=True, help="Environment variable containing the helper bearer token")
 @click.option("--poll-interval", type=float, default=2.0, show_default=True, help="Poll interval in seconds")
@@ -319,6 +365,7 @@ def dispatch(config_path: Path, once: bool, startup_healthcheck_only: bool, log_
 def auth_helper(
     server: str,
     config_path: Path,
+    project_id: str,
     helper_id: str | None,
     token_env: str,
     poll_interval: float,
@@ -337,15 +384,21 @@ def auth_helper(
     configure_logging(log_level)
     import os
 
+    from cairn.dispatcher.config import DispatchConfig
+
+    dispatch_config = DispatchConfig.load(config_path)
+
     config = AuthHelperConfig(
         server=server,
         config_path=config_path,
         helper_id=helper_id or default_helper_id(),
+        project_id=project_id,
         token=os.environ.get(token_env),
         poll_interval=poll_interval,
         notification=notification,
         auto_launch=auto_launch,
         max_parallel_logins=max_parallel,
+        control_plane_mode=dispatch_config.auth_control_plane_mode,
     )
     daemon = AuthHelperDaemon(config)
     try:

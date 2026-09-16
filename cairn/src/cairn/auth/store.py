@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from pathlib import Path
 
-from cairn.auth.models import AuthMeta
+from cairn.auth.models import AuthCaptureManifest, AuthMeta, utcnow
 
 
 class PathTraversalError(ValueError):
@@ -28,6 +29,7 @@ class AuthStore:
 
     STATE_FILENAME = "state.json"
     META_FILENAME = "meta.json"
+    MANIFEST_FILENAME = "manifest.json"
 
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -44,6 +46,9 @@ class AuthStore:
 
     def meta_file(self, project_id: str, auth_ref: str) -> Path:
         return self.profile_dir(project_id, auth_ref) / self.META_FILENAME
+
+    def manifest_file(self, project_id: str, auth_ref: str) -> Path:
+        return self.profile_dir(project_id, auth_ref) / self.MANIFEST_FILENAME
 
     # -- profile management ------------------------------------------------
     def profile_exists(self, project_id: str, auth_ref: str) -> bool:
@@ -78,11 +83,89 @@ class AuthStore:
         self._restrict_permissions(path)
         return path
 
+    def write_capture(
+        self,
+        project_id: str,
+        auth_ref: str,
+        storage_state: dict,
+        *,
+        request_id: str,
+        actor_id: str,
+        capture_generation: int | None = None,
+    ) -> AuthCaptureManifest:
+        """Durably replace state, then publish its request-bound manifest.
+
+        State and manifest use file-plus-directory fsync and ``os.replace``. A
+        manifest is never published before the corresponding state bytes exist.
+        Generation is monotonic per profile unless supplied by a trusted caller.
+        """
+        self.ensure_profile_dir(project_id, auth_ref)
+        state_bytes = json.dumps(
+            storage_state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        state_path = self.state_file(project_id, auth_ref)
+        self._atomic_write_bytes(state_path, state_bytes)
+        self._restrict_permissions(state_path)
+
+        if capture_generation is None:
+            try:
+                capture_generation = self.load_manifest(project_id, auth_ref).capture_generation + 1
+            except (FileNotFoundError, ValueError):
+                capture_generation = 1
+        manifest = AuthCaptureManifest(
+            request_id=request_id,
+            auth_ref=auth_ref,
+            actor_id=actor_id,
+            capture_generation=capture_generation,
+            captured_at=utcnow(),
+            state_sha256=hashlib.sha256(state_bytes).hexdigest(),
+        )
+        self._atomic_write_bytes(
+            self.manifest_file(project_id, auth_ref),
+            manifest.model_dump_json().encode("utf-8"),
+        )
+        self._restrict_permissions(self.manifest_file(project_id, auth_ref))
+        return manifest
+
     def load_state(self, project_id: str, auth_ref: str) -> dict:
         path = self.state_file(project_id, auth_ref)
         if not path.is_file():
             raise FileNotFoundError(f"auth state not found: {path}")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def load_manifest(self, project_id: str, auth_ref: str) -> AuthCaptureManifest:
+        path = self.manifest_file(project_id, auth_ref)
+        if not path.is_file():
+            raise FileNotFoundError(f"auth capture manifest not found: {path}")
+        try:
+            return AuthCaptureManifest.model_validate_json(path.read_text(encoding="utf-8"))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"capture mismatch: invalid manifest: {path}") from exc
+
+    def validate_capture(
+        self,
+        project_id: str,
+        auth_ref: str,
+        *,
+        request_id: str,
+        actor_id: str,
+        capture_generation: int,
+    ) -> AuthCaptureManifest:
+        """Validate the exact binding and digest Dispatcher requires."""
+        try:
+            manifest = self.load_manifest(project_id, auth_ref)
+            state_bytes = self.state_file(project_id, auth_ref).read_bytes()
+        except (FileNotFoundError, OSError) as exc:
+            raise FileNotFoundError(f"capture store unavailable: {auth_ref}") from exc
+        if (
+            manifest.request_id != request_id
+            or manifest.auth_ref != auth_ref
+            or manifest.actor_id != actor_id
+            or manifest.capture_generation != capture_generation
+            or manifest.state_sha256 != hashlib.sha256(state_bytes).hexdigest()
+        ):
+            raise ValueError("capture mismatch")
+        return manifest
 
     def write_meta(self, project_id: str, auth_ref: str, meta: AuthMeta) -> Path:
         path = self.meta_file(project_id, auth_ref)
@@ -141,10 +224,27 @@ class AuthStore:
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
+        AuthStore._atomic_write_bytes(path, content.encode("utf-8"))
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, content: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(content, encoding="utf-8")
+        with open(tmp, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # Windows does not support opening directories for fsync; replace is
+            # still atomic and the file itself has been flushed.
+            pass
 
     @staticmethod
     def _restrict_permissions(path: Path) -> None:

@@ -18,12 +18,14 @@ Hints or Agent prompts.
 
 from cairn.auth.models import (
     AuthCaptureResult,
+    AuthCaptureManifest,
     AuthVerificationResult,
     AuthMeta,
 )
 
 __all__ = [
     "AuthCaptureResult",
+    "AuthCaptureManifest",
     "AuthVerificationResult",
     "AuthMeta",
 ]

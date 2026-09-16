@@ -15,7 +15,7 @@
 
 server: "http://127.0.0.1:8000"
 # Authentication event migration mode: legacy | dual_write | enforced.
-auth_control_plane_mode: "legacy"
+auth_control_plane_mode: "dual_write"
 # Dispatcher-only bearer credential; provision only its digest in the Server deployment.
 # server_token: "<opaque dispatcher token>"
 # FIRST RUN (required): before starting DispatcherLoop, the Server operator must set
@@ -36,6 +36,15 @@ auth_control_plane_mode: "legacy"
 #   helper_token_env: "CAIRN_AUTH_HELPER_TOKEN"  # helper reads this deployment env var
 #   helper_scopes: ["helper.event.submit", "helper.request.read"]
 #   helper_project_allowlist: ["*"]
+#
+# Desktop auth helper (run in the operator's host environment). Set the token first;
+# the helper must always be restricted to one project scope:
+#   export CAIRN_AUTH_HELPER_TOKEN="<opaque helper token>"
+#   uv run --project cairn cairn auth-helper \
+#     --server http://127.0.0.1:8000 \
+#     --config dispatch.yaml \
+#     --project proj_001 \
+#     --token-env CAIRN_AUTH_HELPER_TOKEN
 
 runtime:
   execution: local            # run workers as host processes instead of per-project containers

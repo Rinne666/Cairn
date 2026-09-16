@@ -39,11 +39,11 @@ def create_auth_event(body: CreateAuthEvent, request: Request, response: Respons
         if existing is not None:
             immutable = (
                 existing["project_id"], existing["request_id"], existing["auth_ref"], existing["kind"],
-                existing["occurred_at"], existing["capture_generation"],
+                existing["capture_generation"],
             )
             requested = (
                 body.project_id, body.request_id, body.auth_ref, body.kind,
-                body.occurred_at, body.capture_generation,
+                body.capture_generation,
             )
             if immutable != requested:
                 raise HTTPException(409, "Idempotency key conflict")

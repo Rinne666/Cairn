@@ -6,6 +6,8 @@ import pytest
 
 from cairn.auth.models import AuthMeta
 from cairn.auth.store import AuthStore, PathTraversalError
+from hashlib import sha256
+import json
 
 
 def test_store_project_and_profile_paths(tmp_path: Path) -> None:
@@ -73,3 +75,59 @@ def test_store_remove_profile(tmp_path: Path) -> None:
     assert store.remove_profile("proj_001", "target-user") is True
     assert not store.profile_exists("proj_001", "target-user")
     assert store.remove_profile("proj_001", "target-user") is False
+
+
+def test_store_capture_writes_dispatcher_manifest_bound_to_state(tmp_path: Path) -> None:
+    store = AuthStore(tmp_path)
+    manifest = store.write_capture(
+        "proj_001",
+        "target-user",
+        {"cookies": [{"name": "sid", "value": "opaque"}]},
+        request_id="auth_001",
+        actor_id="helper-a",
+    )
+
+    state_bytes = store.state_file("proj_001", "target-user").read_bytes()
+    assert manifest.request_id == "auth_001"
+    assert manifest.auth_ref == "target-user"
+    assert manifest.actor_id == "helper-a"
+    assert manifest.capture_generation == 1
+    assert manifest.state_sha256 == sha256(state_bytes).hexdigest()
+    assert store.load_manifest("proj_001", "target-user") == manifest
+    assert store.validate_capture(
+        "proj_001",
+        "target-user",
+        request_id="auth_001",
+        actor_id="helper-a",
+        capture_generation=1,
+    ) == manifest
+
+
+def test_store_capture_rejects_state_tampering_and_binding_mismatch(tmp_path: Path) -> None:
+    store = AuthStore(tmp_path)
+    store.write_capture(
+        "proj_001",
+        "target-user",
+        {"cookies": []},
+        request_id="auth_001",
+        actor_id="helper-a",
+    )
+    state = store.state_file("proj_001", "target-user")
+    state.write_text(json.dumps({"cookies": [{"name": "sid", "value": "tampered"}]}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="capture mismatch"):
+        store.validate_capture(
+            "proj_001",
+            "target-user",
+            request_id="auth_001",
+            actor_id="helper-a",
+            capture_generation=1,
+        )
+    with pytest.raises(ValueError, match="capture mismatch"):
+        store.validate_capture(
+            "proj_001",
+            "target-user",
+            request_id="auth-else",
+            actor_id="helper-a",
+            capture_generation=1,
+        )

@@ -864,17 +864,23 @@ cairn auth-helper
 推荐：
 
 ```bash
+# 先在该桌面进程环境设置 CAIRN_AUTH_HELPER_TOKEN；--token-env 默认读取此变量。
 cairn auth-helper \
   --server http://localhost:8000 \
-  --config dispatch.yaml
+  --config dispatch.yaml \
+  --project proj_001 \
+  --token-env CAIRN_AUTH_HELPER_TOKEN
 ```
 
 如果 Cairn 在远程服务器：
 
 ```bash
+# 远程连接同样必须提供 Helper bearer token，并限定项目作用域。
 cairn auth-helper \
   --server https://cairn.example.com \
-  --config local-auth.yaml
+  --config local-auth.yaml \
+  --project proj_001 \
+  --token-env CAIRN_AUTH_HELPER_TOKEN
 ```
 
 ---
@@ -884,18 +890,18 @@ cairn auth-helper \
 ```python
 while running:
 
-    requests = client.list_pending_auth_requests()
+    requests = client.list_pending(project_id)
 
     for request in requests:
 
-        if client.claim(
-            request.id,
-            helper_id,
-        ):
+        if client.submit_event(request, "launch_requested"):
 
-            notify(request)
+            # Dispatcher binds helper_id and claims the request through its event queue.
+            if client.wait_until_claimed(request, actor_id=helper_id):
 
-            launch_login(request)
+                notify(request)
+
+                launch_login(request)
 
     sleep(poll_interval)
 ```

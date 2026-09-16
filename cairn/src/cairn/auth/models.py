@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def utcnow() -> str:
@@ -68,3 +68,37 @@ class AuthMeta(BaseModel):
     created_at: str
     verified_at: str | None = None
     verification: dict[str, bool] = field(default_factory=dict)
+
+
+class AuthCaptureManifest(BaseModel):
+    """Non-secret binding between a captured state file and its auth request.
+
+    The manifest is written only after the state bytes have been durably replaced.
+    Dispatcher-side consumers can therefore reject a stale, replaced, or unrelated
+    state file before opening it in a browser context.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    auth_ref: str
+    actor_id: str
+    capture_generation: int = Field(ge=1)
+    captured_at: str
+    state_sha256: str
+
+    @field_validator("request_id", "auth_ref", "actor_id", "captured_at")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("state_sha256")
+    @classmethod
+    def validate_sha256(cls, value: str) -> str:
+        value = value.strip().lower()
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError("state_sha256 must be a SHA-256 hex digest")
+        return value

@@ -500,6 +500,8 @@ class AuthHelperRequestView(BaseModel):
     auth_ref: str
     login_url: str | None = None
     status: AuthRequestStatus
+    # Returned only to the actor that owns a claimed request; omitted while null.
+    helper_actor_id: str | None = None
 
 
 class AuthCredential(BaseModel):

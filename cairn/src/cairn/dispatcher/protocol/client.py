@@ -208,28 +208,20 @@ class CairnClient:
             path = f"{path}?status={status}"
         return self._request_json("GET", path, json={})
 
-    def claim_auth_request(self, request_id: str, helper_id: str) -> ApiResult:
+    def list_auth_helper_pending(self, project_id: str) -> ApiResult:
+        """Read the narrow project-scoped view intended for a desktop Helper."""
         return self._request_json(
-            "POST",
-            f"/auth-requests/{request_id}/claim",
-            json={"helper_id": helper_id},
+            "GET", f"/projects/{project_id}/auth-requests/helper-pending", json={}
         )
 
-    def auth_request_waiting(self, request_id: str) -> ApiResult:
-        return self._request_json("POST", f"/auth-requests/{request_id}/waiting", json={})
-
-    def auth_request_verifying(self, request_id: str) -> ApiResult:
-        return self._request_json("POST", f"/auth-requests/{request_id}/verifying", json={})
-
-    def auth_request_complete(self, request_id: str) -> ApiResult:
-        return self._request_json("POST", f"/auth-requests/{request_id}/complete", json={})
-
-    def auth_request_fail(self, request_id: str, failure_reason: str | None = None) -> ApiResult:
+    def get_auth_helper_view(self, project_id: str, request_id: str) -> ApiResult:
         return self._request_json(
-            "POST",
-            f"/auth-requests/{request_id}/fail",
-            json={"failure_reason": failure_reason},
+            "GET", f"/projects/{project_id}/auth-requests/{request_id}/helper-view", json={}
         )
+
+    def create_auth_event(self, body: dict[str, Any]) -> ApiResult:
+        """Enqueue one closed Helper/CLI event for Dispatcher consumption."""
+        return self._request_json("POST", "/auth-events", json=body)
 
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
         try:
