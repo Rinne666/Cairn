@@ -9,6 +9,7 @@ from cairn import __version__
 from cairn.server import db
 from cairn.server.routers import (
     auth_events,
+    auth_control,
     auth_deployment,
     auth_helper_views,
     auth_requests,
@@ -42,6 +43,7 @@ app.include_router(intents.router)
 app.include_router(export.router)
 app.include_router(auth_requests.router)
 app.include_router(auth_events.router)
+app.include_router(auth_control.router)
 app.include_router(auth_deployment.router)
 app.include_router(auth_helper_views.router)
 

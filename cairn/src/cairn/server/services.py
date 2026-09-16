@@ -174,6 +174,8 @@ def bootstrap_auth_deployment(
     helper_actor_id: str | None = None,
     helper_scopes: Iterable[str] | None = None,
     helper_project_allowlist: Iterable[str] | None = None,
+    target_roles: dict[str, str] | None = None,
+    target_reasons: dict[str, str] | None = None,
     allow_environment_fallback: bool = True,
 ) -> None:
     """Apply one deployment's AuthConfig snapshot atomically.
@@ -184,6 +186,8 @@ def bootstrap_auth_deployment(
     """
     snapshot_present = False
     apply_targets = target_configs is not None
+    target_roles = target_roles or {}
+    target_reasons = target_reasons or {}
     helper_token_env = getattr(auth_config, "helper_token_env", "CAIRN_AUTH_HELPER_TOKEN")
 
     if auth_config is None and allow_environment_fallback:
@@ -201,6 +205,8 @@ def bootstrap_auth_deployment(
             helper_scopes = snapshot.helper_scopes
             helper_projects = snapshot.helper_project_allowlist
             target_configs = snapshot.targets
+            target_roles = snapshot.target_roles
+            target_reasons = snapshot.target_reasons
             apply_targets = True
         else:
             helper_token = helper_token if helper_token is not None else os.getenv(helper_token_env)
@@ -238,6 +244,13 @@ def bootstrap_auth_deployment(
                 target.name: target.login_url
                 for target in getattr(auth_config, "targets", [])
             }
+            target_roles = {
+                target.name: target.role for target in getattr(auth_config, "targets", [])
+            }
+            target_reasons = {
+                target.name: target.request_reason
+                for target in getattr(auth_config, "targets", [])
+            }
             apply_targets = True
 
     # Validate every field before touching SQLite. This matters for callers that
@@ -250,6 +263,8 @@ def bootstrap_auth_deployment(
             "helper_scopes": list(helper_scopes or ["helper.event.submit", "helper.request.read"]),
             "helper_project_allowlist": list(helper_projects or []),
             "targets": target_configs if target_configs is not None else {},
+            "target_roles": target_roles if target_roles is not None else {},
+            "target_reasons": target_reasons if target_reasons is not None else {},
         }
     )
     if allow_environment_fallback:
@@ -277,7 +292,12 @@ def bootstrap_auth_deployment(
         allow_environment_fallback=False,
     )
     if apply_targets:
-        bootstrap_auth_target_configs(conn, snapshot.targets)
+        bootstrap_auth_target_configs(
+            conn,
+            snapshot.targets,
+            roles=snapshot.target_roles,
+            reasons=snapshot.target_reasons,
+        )
 
 
 def _apply_legacy_credential_cutover(conn: sqlite3.Connection) -> None:
@@ -450,11 +470,20 @@ def _bounded_expiry(existing: str | None, proposed: str) -> str:
     return existing if existing_dt <= proposed_dt else proposed
 
 
-def bootstrap_auth_target_configs(conn: sqlite3.Connection, values: dict[str, str] | None = None) -> None:
+def bootstrap_auth_target_configs(
+    conn: sqlite3.Connection,
+    values: dict[str, str] | None = None,
+    *,
+    roles: dict[str, str] | None = None,
+    reasons: dict[str, str] | None = None,
+) -> None:
     """Replace target authorities with one validated Dispatcher-owned snapshot."""
     if values is None:
         return
     conn.execute("DELETE FROM auth_target_configs")
+    conn.execute("DELETE FROM auth_target_metadata")
+    roles = roles or {}
+    reasons = reasons or {}
     for auth_ref, login_url in values.items():
         if not isinstance(auth_ref, str) or not isinstance(login_url, str):
             continue
@@ -464,6 +493,11 @@ def bootstrap_auth_target_configs(conn: sqlite3.Connection, values: dict[str, st
         conn.execute(
             "INSERT INTO auth_target_configs (auth_ref, login_url) VALUES (?, ?) ON CONFLICT(auth_ref) DO UPDATE SET login_url = excluded.login_url",
             (auth_ref.strip(), login_url),
+        )
+        auth_ref = auth_ref.strip()
+        conn.execute(
+            "INSERT INTO auth_target_metadata (auth_ref, role, request_reason) VALUES (?, ?, ?)",
+            (auth_ref, roles.get(auth_ref, "user"), reasons.get(auth_ref, "authentication_required")),
         )
 
 
@@ -614,6 +648,8 @@ def _is_trusted_proxy(host: str) -> bool:
 
 def reject_migrated_helper_raw_listing(request: Request, conn: sqlite3.Connection) -> None:
     """Deny migrated helper credentials while retaining unauthenticated legacy access."""
+    if get_auth_control_plane_mode(conn) == "legacy":
+        return
     header = request.headers.get("authorization", "")
     scheme, _, token = header.partition(" ")
     if scheme.lower() != "bearer" or not token:
@@ -621,6 +657,26 @@ def reject_migrated_helper_raw_listing(request: Request, conn: sqlite3.Connectio
     principal = lookup_auth_credential(conn, token.strip())
     if principal is not None and {"helper.request.read", "helper.event.submit"} & principal.scopes:
         raise HTTPException(403, "Forbidden")
+
+
+def get_auth_control_plane_mode(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT auth_control_plane_mode FROM settings WHERE rowid = 1").fetchone()
+    return row["auth_control_plane_mode"] if row is not None else "legacy"
+
+
+def guard_legacy_auth_mutation(request: Request, conn: sqlite3.Connection) -> None:
+    """Apply the migration mode to an old AuthRequest mutation route."""
+    mode = get_auth_control_plane_mode(conn)
+    if mode == "enforced":
+        raise HTTPException(410, "Authentication events are required")
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if mode == "dual_write" and scheme.lower() == "bearer" and token:
+        principal = lookup_auth_credential(conn, token.strip())
+        if principal is not None and (
+            "helper.event.submit" in principal.scopes or "helper.request.read" in principal.scopes
+        ):
+            raise HTTPException(410, "Authentication events are required")
 
 
 def auth_event_to_model(row: sqlite3.Row) -> AuthEvent:
@@ -633,6 +689,284 @@ def auth_event_to_model(row: sqlite3.Row) -> AuthEvent:
         claimed_by=row["claimed_by"], claim_expires_at=row["claim_expires_at"], processed_at=row["processed_at"],
         outcome_code=row["outcome_code"], capture_generation=row["capture_generation"],
     )
+
+
+AUTH_EVENT_CLAIM_SECONDS = 30
+AUTH_EVENT_MAX_ATTEMPTS = 3
+
+
+def _append_auth_lifecycle(
+    conn: sqlite3.Connection,
+    request_id: str,
+    event_id: str,
+    kind: str,
+    outcome_code: str,
+    *,
+    recorded_at: str | None = None,
+) -> bool:
+    """Append a lifecycle entry once, returning False for a replay."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO auth_lifecycle_events
+                (request_id, event_id, sequence, kind, recorded_at, outcome_code)
+            SELECT ?, ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?
+              FROM auth_lifecycle_events
+             WHERE request_id = ?
+            """,
+            (request_id, event_id, kind, recorded_at or utcnow(), outcome_code, request_id),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def claim_auth_event_atomic(
+    conn: sqlite3.Connection,
+    dispatcher_id: str,
+    *,
+    lease_seconds: int = AUTH_EVENT_CLAIM_SECONDS,
+    project_allowlist: frozenset[str] | None = None,
+) -> sqlite3.Row | None:
+    """Claim the oldest queued event with a short server-clock lease."""
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    lease_expires = (now_dt + timedelta(seconds=lease_seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    params: list[object] = [now]
+    allowlist_sql = ""
+    if project_allowlist is not None and "*" not in project_allowlist:
+        if project_allowlist:
+            placeholders = ",".join("?" for _ in project_allowlist)
+            allowlist_sql = f" AND project_id IN ({placeholders})"
+            params.extend(sorted(project_allowlist))
+        else:
+            # Empty is an explicit deny-all allowlist; only ``None`` means the
+            # direct service caller did not request project filtering.
+            allowlist_sql = " AND 0"
+    # Select-and-update in one SQLite statement. This avoids the check-then-act
+    # race where two Dispatcher connections could both observe the same queued
+    # event before either writes its lease.
+    update_query = f"""
+        UPDATE auth_events
+           SET state = 'claimed', claimed_by = ?, claim_expires_at = ?,
+               attempt_count = attempt_count + 1
+         WHERE id = (
+             SELECT id FROM auth_events
+              WHERE state IN ('queued', 'retryable')
+                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                {allowlist_sql}
+              ORDER BY received_at, rowid
+              LIMIT 1
+         )
+         RETURNING *
+    """
+    return conn.execute(
+        update_query,
+        (dispatcher_id, lease_expires, *params),
+    ).fetchone()
+
+
+def recover_auth_event_claims(
+    conn: sqlite3.Connection, *, project_allowlist: frozenset[str] | None = None
+) -> int:
+    """Move expired claims back to retryable, rejecting after three attempts."""
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    query = "SELECT * FROM auth_events WHERE state = 'claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?"
+    params: list[object] = [now]
+    if project_allowlist is not None and "*" not in project_allowlist:
+        if project_allowlist:
+            placeholders = ",".join("?" for _ in project_allowlist)
+            query += f" AND project_id IN ({placeholders})"
+            params.extend(sorted(project_allowlist))
+        else:
+            query += " AND 0"
+    rows = conn.execute(query, tuple(params)).fetchall()
+    changed = 0
+    for row in rows:
+        attempts = int(row["attempt_count"])
+        if row["kind"] == "launch_requested":
+            conn.execute(
+                "UPDATE auth_requests SET status = 'pending', claimed_by = NULL, claimed_at = NULL, helper_actor_id = NULL WHERE id = ? AND status = 'claimed' AND helper_actor_id = ?",
+                (row["request_id"], row["actor_id"]),
+            )
+        if attempts >= AUTH_EVENT_MAX_ATTEMPTS:
+            cursor = conn.execute(
+                "UPDATE auth_events SET state = 'rejected', processed_at = ?, outcome_code = 'retry_exhausted', claimed_by = NULL, claim_expires_at = NULL WHERE id = ? AND state = 'claimed'",
+                (now, row["id"]),
+            )
+            if cursor.rowcount:
+                _append_auth_lifecycle(conn, row["request_id"], row["id"], "retry_exhausted", "retry_exhausted", recorded_at=now)
+                changed += cursor.rowcount
+            continue
+        delay = 2 ** max(0, attempts - 1)
+        next_attempt = (now_dt + timedelta(seconds=delay)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cursor = conn.execute(
+            "UPDATE auth_events SET state = 'retryable', next_attempt_at = ?, claimed_by = NULL, claim_expires_at = NULL WHERE id = ? AND state = 'claimed'",
+            (next_attempt, row["id"]),
+        )
+        changed += cursor.rowcount
+    return changed
+
+
+def _auth_event_reject(
+    conn: sqlite3.Connection, event: sqlite3.Row, *, outcome_code: str
+) -> sqlite3.Row:
+    now = utcnow()
+    conn.execute(
+        "UPDATE auth_events SET state = 'rejected', processed_at = ?, outcome_code = ?, claimed_by = NULL, claim_expires_at = NULL WHERE id = ?",
+        (now, outcome_code, event["id"]),
+    )
+    _append_auth_lifecycle(conn, event["request_id"], event["id"], "rejected", outcome_code, recorded_at=now)
+    return conn.execute("SELECT * FROM auth_events WHERE id = ?", (event["id"],)).fetchone()
+
+
+def apply_auth_event_atomic(
+    conn: sqlite3.Connection,
+    event_id: str,
+    dispatcher_id: str,
+    *,
+    operation: str,
+    outcome_code: str | None = None,
+) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """Execute one Dispatcher-selected operation atomically.
+
+    The Server validates that the selected operation is compatible with the
+    immutable event and current request storage state, but never chooses a
+    transition or invents a verification result.
+    """
+    event = conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone()
+    if event is None:
+        raise HTTPException(404, "Auth event not found")
+    now = utcnow()
+    if event["state"] in ("applied", "rejected"):
+        request = get_auth_request_or_404(conn, event["request_id"])
+        return event, request
+    if event["state"] != "claimed" or event["claimed_by"] != dispatcher_id or (
+        event["claim_expires_at"] is not None and event["claim_expires_at"] <= now
+    ):
+        raise HTTPException(409, "Auth event claim is not owned by dispatcher")
+    request = get_auth_request_or_404(conn, event["request_id"])
+    if request["project_id"] != event["project_id"] or request["auth_ref"] != event["auth_ref"]:
+        event = _auth_event_reject(conn, event, outcome_code="request_mismatch")
+        return event, request
+
+    kind = event["kind"]
+    status = request["status"]
+    actor = event["actor_id"]
+    bound_actor = request["helper_actor_id"]
+    if operation == "reject":
+        if outcome_code not in {
+            None,
+            "invalid_transition",
+            "not_request_owner",
+            "request_mismatch",
+            "retry_exhausted",
+            "expired",
+        }:
+            raise HTTPException(409, "Outcome is not valid for Dispatcher operation")
+        event = _auth_event_reject(conn, event, outcome_code=outcome_code or "invalid_transition")
+        return event, request
+
+    expected: dict[str, tuple[str, ...]] = {
+        "bind_actor": ("launch_requested",),
+        "mark_waiting_user": ("browser_opened",),
+        "begin_verification": ("login_succeeded",),
+        "mark_failed": ("login_failed",),
+    }
+    if operation not in expected or kind not in expected[operation]:
+        raise HTTPException(409, "Dispatcher operation does not match auth event")
+    if operation in {"bind_actor", "mark_waiting_user", "begin_verification"} and outcome_code is not None:
+        raise HTTPException(409, "Outcome is not valid for Dispatcher operation")
+    if operation == "mark_failed" and outcome_code not in {
+        None,
+        "login_failed",
+        "verification_failed",
+        "store_unavailable",
+        "capture_mismatch",
+    }:
+        raise HTTPException(409, "Outcome is not valid for Dispatcher operation")
+    if operation == "bind_actor":
+        if status != "pending" or (bound_actor is not None and bound_actor != actor):
+            raise HTTPException(409, "Dispatcher operation is not legal for auth request")
+        conn.execute(
+            "UPDATE auth_requests SET status = 'claimed', claimed_by = ?, claimed_at = ?, helper_actor_id = ? WHERE id = ?",
+            (actor, now, actor, request["id"]),
+        )
+        _append_auth_lifecycle(conn, request["id"], event_id, "claimed", "claimed", recorded_at=now)
+        outcome_code = None
+    elif operation == "mark_waiting_user":
+        if bound_actor != actor or status != "claimed":
+            raise HTTPException(409, "Dispatcher operation is not legal for auth request")
+        conn.execute("UPDATE auth_requests SET status = 'waiting_user' WHERE id = ?", (request["id"],))
+        _append_auth_lifecycle(conn, request["id"], event_id, "waiting_user", "waiting_user", recorded_at=now)
+        outcome_code = None
+    elif operation == "begin_verification":
+        if bound_actor != actor or status not in {"waiting_user", "verifying"}:
+            raise HTTPException(409, "Dispatcher operation is not legal for auth request")
+        if status == "verifying":
+            verifying = conn.execute(
+                """
+                SELECT event_id FROM auth_lifecycle_events
+                WHERE request_id = ? AND kind = 'verifying'
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (request["id"],),
+            ).fetchone()
+            if verifying is None or verifying["event_id"] != event_id:
+                event = _auth_event_reject(conn, event, outcome_code="invalid_transition")
+                return event, request
+        if status == "waiting_user":
+            conn.execute("UPDATE auth_requests SET status = 'verifying' WHERE id = ?", (request["id"],))
+            _append_auth_lifecycle(conn, request["id"], event_id, "verifying", "verifying", recorded_at=now)
+        # Verification is a Dispatcher/AuthStore concern deferred to the next
+        # phase. Keep both the claim and request in verifying for retry/recovery.
+        return (
+            conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone(),
+            conn.execute("SELECT * FROM auth_requests WHERE id = ?", (request["id"],)).fetchone(),
+        )
+    elif operation == "mark_failed":
+        if bound_actor != actor or status not in {"claimed", "waiting_user", "verifying"}:
+            raise HTTPException(409, "Dispatcher operation is not legal for auth request")
+        outcome_code = outcome_code or "login_failed"
+        conn.execute(
+            "UPDATE auth_requests SET status = 'failed', completed_at = ?, failure_reason = ? WHERE id = ?",
+            (now, outcome_code, request["id"]),
+        )
+        _append_auth_lifecycle(conn, request["id"], event_id, "failed", outcome_code, recorded_at=now)
+
+    conn.execute(
+        "UPDATE auth_events SET state = 'applied', processed_at = ?, outcome_code = ?, claimed_by = NULL, claim_expires_at = NULL WHERE id = ?",
+        (now, outcome_code or status, event_id),
+    )
+    return (
+        conn.execute("SELECT * FROM auth_events WHERE id = ?", (event_id,)).fetchone(),
+        conn.execute("SELECT * FROM auth_requests WHERE id = ?", (request["id"],)).fetchone(),
+    )
+
+
+def expire_due_auth_requests(
+    conn: sqlite3.Connection, *, project_allowlist: frozenset[str] | None = None
+) -> int:
+    """Expire due nonterminal requests using the persisted Server TTL."""
+    now = utcnow()
+    query = "SELECT * FROM auth_requests WHERE status IN ('pending','claimed','waiting_user','verifying') AND expires_at IS NOT NULL AND expires_at <= ?"
+    params: list[object] = [now]
+    if project_allowlist is not None and "*" not in project_allowlist:
+        if project_allowlist:
+            placeholders = ",".join("?" for _ in project_allowlist)
+            query += f" AND project_id IN ({placeholders})"
+            params.extend(sorted(project_allowlist))
+        else:
+            query += " AND 0"
+    rows = conn.execute(query, tuple(params)).fetchall()
+    for row in rows:
+        conn.execute("UPDATE auth_requests SET status = 'expired', completed_at = ? WHERE id = ? AND status IN ('pending','claimed','waiting_user','verifying')", (now, row["id"]))
+        _append_auth_lifecycle(conn, row["id"], f"ttl:{row['id']}:{row['expiry_generation']}", "expired", "expired", recorded_at=now)
+    return len(rows)
 
 
 def next_project_id(conn: sqlite3.Connection) -> str:
@@ -817,6 +1151,15 @@ def get_auth_request_ttl(conn: sqlite3.Connection) -> int:
     return row["auth_request_ttl"]
 
 
+def auth_request_expiry(created_at: str, ttl: int) -> str | None:
+    if ttl <= 0:
+        return None
+    parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed + timedelta(seconds=ttl)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def project_reason_from_row(row: sqlite3.Row) -> ProjectReason | None:
     if row["reason_worker"] is None:
         return None
@@ -953,6 +1296,9 @@ def auth_request_to_model(row: sqlite3.Row) -> "AuthRequest":
         claimed_at=row["claimed_at"],
         completed_at=row["completed_at"],
         failure_reason=row["failure_reason"],
+        helper_actor_id=row["helper_actor_id"],
+        expires_at=row["expires_at"],
+        expiry_generation=row["expiry_generation"],
     )
 
 
@@ -1075,16 +1421,15 @@ def expire_stale_requests(conn: sqlite3.Connection, request_ttl: int) -> int:
     """
     if request_ttl <= 0:
         return 0
-    now = datetime.now(timezone.utc)
-    cutoff = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    cursor = conn.execute(
-        """
-        UPDATE auth_requests
-        SET status = 'expired',
-            completed_at = ?
-        WHERE status IN ('pending', 'claimed', 'waiting_user', 'verifying')
-          AND (julianday(?) - julianday(created_at)) * 86400 > ?
-        """,
-        (cutoff, cutoff, request_ttl),
-    )
-    return cursor.rowcount
+    # Rows created before the expiry column was introduced have a null value;
+    # initialize those deterministically before using the same lifecycle-aware
+    # reaper as the Dispatcher internal endpoint.
+    rows = conn.execute(
+        "SELECT id, created_at FROM auth_requests WHERE status IN ('pending','claimed','waiting_user','verifying') AND expires_at IS NULL"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE auth_requests SET expires_at = ? WHERE id = ? AND expires_at IS NULL",
+            (auth_request_expiry(row["created_at"], request_ttl), row["id"]),
+        )
+    return expire_due_auth_requests(conn)

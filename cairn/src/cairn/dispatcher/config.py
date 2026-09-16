@@ -17,6 +17,7 @@ CompletedAction = Literal["remove", "stop"]
 WorkerHealthcheckMode = Literal["startup_and_task", "startup_only", "disabled"]
 ExecutionMode = Literal["container", "local"]
 LocalCompletedAction = Literal["keep", "remove"]
+AuthControlPlaneMode = Literal["legacy", "dual_write", "enforced"]
 
 WORKER_ENV_KEYS: dict[WorkerType, tuple[str, ...]] = {
     "claudecode": (
@@ -169,6 +170,10 @@ class AuthTargetConfig(BaseModel):
 
     role: str
 
+    # Closed, config-derived request summary. Worker-provided prose is never
+    # used for migrated internal request creation.
+    request_reason: str = "authentication_required"
+
     indexed_db: bool = True
 
     verify: AuthVerifyConfig
@@ -176,8 +181,8 @@ class AuthTargetConfig(BaseModel):
 
 class AuthInterventionConfig(BaseModel):
     enabled: bool = True
-    request_ttl: int = Field(default=1800, gt=0)
-    claim_ttl: int = Field(default=300, gt=0)
+    request_ttl: int = Field(default=1800, ge=0)
+    claim_ttl: int = Field(default=300, ge=0)
     allow_roles: list[str] = Field(default_factory=list)
 
 
@@ -268,6 +273,7 @@ class DispatchConfig(BaseModel):
     server: str
     # Opaque Dispatcher credential; only its digest is provisioned by the Server.
     server_token: str | None = None
+    auth_control_plane_mode: AuthControlPlaneMode = "legacy"
     runtime: RuntimeConfig
     tasks: TasksConfig
     container: ContainerConfig | None = None
@@ -357,6 +363,10 @@ class DispatchConfig(BaseModel):
                 "helper_scopes": list(self.auth.helper_scopes),
                 "helper_project_allowlist": list(self.auth.helper_project_allowlist),
                 "targets": {target.name: target.login_url for target in self.auth.targets},
+                "target_roles": {target.name: target.role for target in self.auth.targets},
+                "target_reasons": {
+                    target.name: target.request_reason for target in self.auth.targets
+                },
             }
         )
         return snapshot

@@ -46,6 +46,17 @@ class _InterventionClient(FakeClient):
         )
         return ApiResult(201, {"id": "auth_001"})
 
+    def create_auth_request_internal(
+        self,
+        project_id,
+        source_fact_ids,
+        auth_ref,
+    ):
+        self.created_auth_requests.append(
+            (project_id, source_fact_ids, auth_ref)
+        )
+        return ApiResult(201, {"id": "auth_001"})
+
 
 def test_reason_creates_auth_request_from_intervention(monkeypatch) -> None:
     config = _config_with_auth([])
@@ -80,6 +91,39 @@ def test_reason_creates_auth_request_from_intervention(monkeypatch) -> None:
     assert client.created_intents == []
     assert client.created_auth_requests == [
         ("proj_001", ["f001"], "target-user", "user", "orders need auth", None)
+    ]
+
+
+def test_reason_internal_create_uses_configured_target_authority(monkeypatch) -> None:
+    config = _config_with_auth([])
+    config = config.model_copy(update={"auth_control_plane_mode": "dual_write"})
+    project = make_project()
+    client = _InterventionClient(project)
+    monkeypatch.setattr(reason, "get_driver", lambda *_a, **_k: FakeDriver())
+    monkeypatch.setattr(reason.HeartbeatLease, "for_reason", _lease_factory(FakeLease()))
+    monkeypatch.setattr(
+        reason,
+        "run_worker_process",
+        lambda *_args, **_kwargs: ProcessResult(
+            0,
+            '{"accepted":true,"data":{"interventions":[{"type":"auth","from":["f001"],"target":"target-user","role":"forged","reason":"secret llm reason","login_url":"https://evil.invalid"}]}}',
+            "",
+        ),
+    )
+
+    outcome = reason.run_reason_task(
+        config,
+        client,
+        FakeContainerManager(),
+        project,
+        "graph",
+        config.workers[0],
+        TaskCancellation(),
+    )
+
+    assert outcome == "success"
+    assert client.created_auth_requests == [
+        ("proj_001", ["f001"], "target-user")
     ]
 
 

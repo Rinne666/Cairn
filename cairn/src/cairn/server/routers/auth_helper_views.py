@@ -10,6 +10,7 @@ from cairn.server.services import (
     get_auth_claim_ttl,
     get_auth_request_or_404,
     get_auth_request_ttl,
+    get_auth_control_plane_mode,
     get_project_or_404,
     require_auth_principal,
 )
@@ -39,8 +40,9 @@ def list_helper_pending(project_id: str, request: Request):
     with get_conn() as conn:
         require_auth_principal(request, conn, scope="helper.request.read", project_id=project_id)
         get_project_or_404(conn, project_id)
-        expire_stale_claims(conn, get_auth_claim_ttl(conn))
-        expire_stale_requests(conn, get_auth_request_ttl(conn))
+        if get_auth_control_plane_mode(conn) == "legacy":
+            expire_stale_claims(conn, get_auth_claim_ttl(conn))
+            expire_stale_requests(conn, get_auth_request_ttl(conn))
         rows = conn.execute(
             """
             SELECT id, auth_ref, login_url, status
@@ -61,8 +63,9 @@ def get_helper_view(project_id: str, request_id: str, request: Request):
     with get_conn() as conn:
         require_auth_principal(request, conn, scope="helper.request.read", project_id=project_id)
         get_project_or_404(conn, project_id)
-        expire_stale_claims(conn, get_auth_claim_ttl(conn))
-        expire_stale_requests(conn, get_auth_request_ttl(conn))
+        if get_auth_control_plane_mode(conn) == "legacy":
+            expire_stale_claims(conn, get_auth_claim_ttl(conn))
+            expire_stale_requests(conn, get_auth_request_ttl(conn))
         row = get_auth_request_or_404(conn, request_id)
         if row["project_id"] != project_id:
             # Avoid cross-project existence leaks from helper-scoped views.

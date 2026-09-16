@@ -30,6 +30,8 @@ def apply_auth_deployment(
                 helper_actor_id=body.helper_actor_id,
                 helper_scopes=body.helper_scopes,
                 helper_project_allowlist=body.helper_project_allowlist,
+                target_roles=body.target_roles,
+                target_reasons=body.target_reasons,
                 allow_environment_fallback=False,
             )
         except ValueError as exc:

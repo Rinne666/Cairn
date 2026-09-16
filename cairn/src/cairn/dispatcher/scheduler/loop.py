@@ -11,8 +11,9 @@ from pathlib import Path
 import requests
 
 from cairn.dispatcher.config import DispatchConfig, LocalConfig, WorkerConfig
+from cairn.dispatcher.auth_control import DispatcherAuthControl
 from cairn.dispatcher.models import ReasonCheckpoint, RunningTask
-from cairn.dispatcher.protocol.client import CairnClient
+from cairn.dispatcher.protocol.client import CairnClient, ProtocolError
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.runtime.local_backend import LocalBackend
@@ -45,6 +46,7 @@ class DispatcherLoop:
         self.config_path = config_path
         self.config = DispatchConfig.load(config_path)
         self.client = CairnClient(self.config.server, server_token=self.config.server_token)
+        self.auth_control = DispatcherAuthControl(self.client)
         if self.config.runtime.execution == "local":
             self.container_manager = LocalBackend(self.config.local or LocalConfig(), self.config.auth)
         else:
@@ -89,6 +91,11 @@ class DispatcherLoop:
                         self._settings_checked = True
                     self._reap_futures()
                     self._reap_cleanup_futures()
+                    if not self._run_auth_control_cycle():
+                        if once:
+                            raise RuntimeError("authentication control cycle failed")
+                        time.sleep(self.config.runtime.interval)
+                        continue
                     summaries = self.client.list_projects()
                     self._initialize_reason_checkpoints(summaries)
                     self._refresh_runtime_projects(summaries)
@@ -925,6 +932,20 @@ class DispatcherLoop:
 
     def _validate_server_settings(self) -> None:
         settings = self.client.get_settings()
+        if self.config.auth_control_plane_mode != settings.auth_control_plane_mode:
+            raise RuntimeError(
+                "dispatcher auth_control_plane_mode must equal server auth_control_plane_mode"
+            )
+        if self.config.auth is not None:
+            intervention = self.config.auth.intervention
+            if intervention.request_ttl != settings.auth_request_ttl:
+                raise RuntimeError(
+                    "dispatcher auth intervention.request_ttl must equal server auth_request_ttl"
+                )
+            if intervention.claim_ttl != settings.auth_claim_ttl:
+                raise RuntimeError(
+                    "dispatcher auth intervention.claim_ttl must equal server auth_claim_ttl"
+                )
         interval = self.config.runtime.interval
         for name, value in (("intent_timeout", settings.intent_timeout), ("reason_timeout", settings.reason_timeout)):
             if value <= interval:
@@ -947,6 +968,19 @@ class DispatcherLoop:
                 value,
                 interval,
             )
+
+    def _run_auth_control_cycle(self) -> bool:
+        if self.config.auth_control_plane_mode == "legacy":
+            return True
+        control = getattr(self, "auth_control", None)
+        if control is None:
+            return False
+        try:
+            results = control.run_cycle()
+            return all(result.ok for result in results)
+        except (AttributeError, ProtocolError, requests.RequestException):
+            LOG.exception("auth control cycle failed")
+            return False
 
     def _run_startup_healthchecks(self, *, show_commands: bool) -> None:
         results = run_startup_healthchecks(self.config, show_commands=show_commands)

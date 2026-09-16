@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS settings (
     intent_timeout INTEGER NOT NULL DEFAULT 15,
     reason_timeout INTEGER NOT NULL DEFAULT 15,
     auth_claim_ttl INTEGER NOT NULL DEFAULT 300,
-    auth_request_ttl INTEGER NOT NULL DEFAULT 1800
+    auth_request_ttl INTEGER NOT NULL DEFAULT 1800,
+    auth_control_plane_mode TEXT NOT NULL DEFAULT 'legacy'
 );
 
 INSERT OR IGNORE INTO settings (rowid, intent_timeout, reason_timeout) VALUES (1, 15, 15);
@@ -165,6 +166,12 @@ CREATE TABLE IF NOT EXISTS auth_target_configs (
     auth_ref TEXT PRIMARY KEY,
     login_url TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS auth_target_metadata (
+    auth_ref TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    request_reason TEXT NOT NULL
+);
 """
 
 
@@ -205,6 +212,10 @@ def _ensure_settings_columns(conn: sqlite3.Connection) -> None:
     if "auth_request_ttl" not in columns:
         conn.execute(
             "ALTER TABLE settings ADD COLUMN auth_request_ttl INTEGER NOT NULL DEFAULT 1800"
+        )
+    if "auth_control_plane_mode" not in columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN auth_control_plane_mode TEXT NOT NULL DEFAULT 'legacy'"
         )
 
 

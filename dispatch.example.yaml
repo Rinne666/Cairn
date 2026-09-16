@@ -1,5 +1,7 @@
 # Cairn server API endpoint.
 server: "http://cairn-server:8000"
+# Authentication event migration mode: legacy | dual_write | enforced.
+auth_control_plane_mode: "legacy"
 # Dispatcher-only bearer credential; provision only its digest in the Server deployment.
 # server_token: "<opaque dispatcher token>"
 # FIRST RUN (required): before starting DispatcherLoop, the Server operator must set

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from cairn.server.db import get_conn
 from cairn.server.models import (
@@ -24,6 +24,11 @@ from cairn.server.services import (
     utcnow,
     validate_facts_exist,
     _join_source_fact_ids,
+    auth_request_expiry,
+    guard_legacy_auth_mutation,
+    _append_auth_lifecycle,
+    reject_migrated_helper_raw_listing,
+    get_auth_control_plane_mode,
 )
 
 router = APIRouter(tags=["auth-requests"])
@@ -36,6 +41,8 @@ def _reap_expired(conn) -> None:
     TTL enforcement is done lazily here rather than by a background job. It is cheap
     (indexed UPDATE) and idempotent.
     """
+    if get_auth_control_plane_mode(conn) != "legacy":
+        return
     expire_stale_claims(conn, get_auth_claim_ttl(conn))
     expire_stale_requests(conn, get_auth_request_ttl(conn))
 
@@ -45,8 +52,9 @@ def _reap_expired(conn) -> None:
     response_model=AuthRequest,
     status_code=201,
 )
-def create_auth_request(project_id: str, body: CreateAuthRequest):
+def create_auth_request(project_id: str, body: CreateAuthRequest, request: Request):
     with get_conn() as conn:
+        guard_legacy_auth_mutation(request, conn)
         check_project_active(conn, project_id)
         validate_facts_exist(conn, project_id, body.source_fact_ids)
 
@@ -65,12 +73,13 @@ def create_auth_request(project_id: str, body: CreateAuthRequest):
 
         now = utcnow()
         request_id = next_auth_request_id(conn)
+        expires_at = auth_request_expiry(now, get_auth_request_ttl(conn))
         conn.execute(
             """
             INSERT INTO auth_requests (
                 id, project_id, source_fact_ids, auth_ref, role, login_url,
-                reason, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                reason, status, created_at, expires_at, expiry_generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 1)
             """,
             (
                 request_id,
@@ -81,8 +90,10 @@ def create_auth_request(project_id: str, body: CreateAuthRequest):
                 body.login_url,
                 body.reason,
                 now,
+                expires_at,
             ),
         )
+        _append_auth_lifecycle(conn, request_id, f"create:{request_id}", "created", "created", recorded_at=now)
         row = get_auth_request_or_404(conn, request_id)
         return auth_request_to_model(row)
 
@@ -91,8 +102,9 @@ def create_auth_request(project_id: str, body: CreateAuthRequest):
     "/auth-requests",
     response_model=list[AuthRequest],
 )
-def list_auth_requests(status: str | None = Query(default=None)):
+def list_auth_requests(request: Request, status: str | None = Query(default=None)):
     with get_conn() as conn:
+        reject_migrated_helper_raw_listing(request, conn)
         _reap_expired(conn)
         if status is not None:
             rows = conn.execute(
@@ -110,8 +122,9 @@ def list_auth_requests(status: str | None = Query(default=None)):
     "/auth-requests/{request_id}/claim",
     response_model=AuthRequest,
 )
-def claim_auth_request(request_id: str, body: ClaimAuthRequest):
+def claim_auth_request(request_id: str, body: ClaimAuthRequest, request: Request):
     with get_conn() as conn:
+        guard_legacy_auth_mutation(request, conn)
         _reap_expired(conn)
         get_auth_request_or_404(conn, request_id)
         claimed = claim_auth_request_atomic(conn, request_id, body.helper_id)
@@ -151,8 +164,9 @@ def _transition(
     "/auth-requests/{request_id}/waiting",
     response_model=AuthRequest,
 )
-def waiting_user(request_id: str):
+def waiting_user(request_id: str, request: Request):
     with get_conn() as conn:
+        guard_legacy_auth_mutation(request, conn)
         return _transition(conn, request_id, "claimed", "waiting_user")
 
 
@@ -160,8 +174,9 @@ def waiting_user(request_id: str):
     "/auth-requests/{request_id}/verifying",
     response_model=AuthRequest,
 )
-def verifying(request_id: str):
+def verifying(request_id: str, request: Request):
     with get_conn() as conn:
+        guard_legacy_auth_mutation(request, conn)
         return _transition(conn, request_id, "waiting_user", "verifying")
 
 
@@ -169,8 +184,9 @@ def verifying(request_id: str):
     "/auth-requests/{request_id}/complete",
     response_model=AuthRequest,
 )
-def complete(request_id: str):
+def complete(request_id: str, request: Request):
     with get_conn() as conn:
+        guard_legacy_auth_mutation(request, conn)
         return _transition(conn, request_id, "verifying", "completed")
 
 
@@ -178,8 +194,9 @@ def complete(request_id: str):
     "/auth-requests/{request_id}/fail",
     response_model=AuthRequest,
 )
-def fail(request_id: str, body: FailAuthRequest):
+def fail(request_id: str, body: FailAuthRequest, request: Request):
     with get_conn() as conn:
+        guard_legacy_auth_mutation(request, conn)
         row = get_auth_request_or_404(conn, request_id)
         if row["status"] not in ("claimed", "waiting_user", "verifying"):
             raise HTTPException(

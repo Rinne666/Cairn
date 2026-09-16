@@ -12,6 +12,7 @@ class Settings(BaseModel):
     reason_timeout: int = Field(ge=5)
     auth_claim_ttl: int = Field(default=300, ge=0)
     auth_request_ttl: int = Field(default=1800, ge=0)
+    auth_control_plane_mode: Literal["legacy", "dual_write", "enforced"] = "legacy"
 
 
 class Fact(BaseModel):
@@ -281,6 +282,9 @@ class AuthRequest(BaseModel):
     claimed_at: str | None = None
     completed_at: str | None = None
     failure_reason: str | None = None
+    helper_actor_id: str | None = None
+    expires_at: str | None = None
+    expiry_generation: int = 1
 
 
 class CreateAuthRequest(BaseModel):
@@ -324,6 +328,94 @@ class ClaimAuthRequest(BaseModel):
 
 class FailAuthRequest(BaseModel):
     failure_reason: str | None = None
+
+
+class CreateAuthRequestInternal(BaseModel):
+    """Dispatcher-only request creation payload.
+
+    The Dispatcher supplies config-derived role/reason data; callers using the
+    public route continue to use :class:`CreateAuthRequest` during migration.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    project_id: str
+    source_fact_ids: list[str] = Field(min_length=1)
+    auth_ref: str
+
+    @field_validator("project_id", "auth_ref")
+    @classmethod
+    def validate_non_empty_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("source_fact_ids")
+    @classmethod
+    def validate_fact_ids(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        if any(not item for item in cleaned):
+            raise ValueError("fact ids must not be empty")
+        return cleaned
+
+
+class AuthEventClaimRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    dispatcher_id: str = "dispatcher"
+
+    @field_validator("dispatcher_id")
+    @classmethod
+    def validate_dispatcher_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
+AuthEventOperation = Literal[
+    "bind_actor",
+    "mark_waiting_user",
+    "begin_verification",
+    "mark_failed",
+    "reject",
+]
+AuthEventOutcome = Literal[
+    "verified",
+    "verification_failed",
+    "login_failed",
+    "invalid_transition",
+    "not_request_owner",
+    "request_mismatch",
+    "retry_exhausted",
+    "expired",
+    "store_unavailable",
+    "capture_mismatch",
+]
+
+
+class AuthEventApplyRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    event_id: str
+    dispatcher_id: str = "dispatcher"
+    operation: AuthEventOperation
+    outcome_code: AuthEventOutcome | None = None
+
+    @field_validator("event_id", "dispatcher_id")
+    @classmethod
+    def validate_ids(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
+class AuthEventReapRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    dispatcher_id: str | None = None
 
 
 AuthEventKind = Literal[
@@ -437,6 +529,8 @@ class AuthDeploymentSnapshot(BaseModel):
     )
     helper_project_allowlist: list[str] = Field(default_factory=list)
     targets: dict[str, str] = Field(default_factory=dict)
+    target_roles: dict[str, str] = Field(default_factory=dict)
+    target_reasons: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("dispatcher_token", "helper_token")
     @classmethod
@@ -485,4 +579,16 @@ class AuthDeploymentSnapshot(BaseModel):
             if ref in cleaned:
                 raise ValueError("targets must not contain duplicate auth refs")
             cleaned[ref] = url
+        return cleaned
+
+    @field_validator("target_roles", "target_reasons")
+    @classmethod
+    def validate_target_metadata(cls, value: dict[str, str]) -> dict[str, str]:
+        cleaned: dict[str, str] = {}
+        for key, item in value.items():
+            key = key.strip()
+            item = item.strip()
+            if not key or not item:
+                raise ValueError("target metadata must contain non-empty values")
+            cleaned[key] = item
         return cleaned

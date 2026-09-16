@@ -72,6 +72,50 @@ class CairnClient:
             json=snapshot,
         )
 
+    def create_auth_request_internal(
+        self,
+        project_id: str,
+        source_fact_ids: list[str],
+        auth_ref: str,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            "/internal/auth/requests",
+            json={
+                "project_id": project_id,
+                "source_fact_ids": source_fact_ids,
+                "auth_ref": auth_ref,
+            },
+        )
+
+    def claim_auth_event(self, dispatcher_id: str) -> ApiResult:
+        return self._request_json(
+            "POST", "/internal/auth/events/claim", json={"dispatcher_id": dispatcher_id}
+        )
+
+    def apply_auth_event(
+        self,
+        event_id: str,
+        dispatcher_id: str,
+        *,
+        operation: str,
+        outcome_code: str | None = None,
+    ) -> ApiResult:
+        body: dict[str, Any] = {
+            "event_id": event_id,
+            "dispatcher_id": dispatcher_id,
+            "operation": operation,
+        }
+        if outcome_code is not None:
+            body["outcome_code"] = outcome_code
+        return self._request_json("POST", "/internal/auth/events/apply", json=body)
+
+    def recover_auth_events(self) -> ApiResult:
+        return self._request_json("POST", "/internal/auth/events/recover", json={})
+
+    def expire_auth_requests(self) -> ApiResult:
+        return self._request_json("POST", "/internal/auth/requests/expire", json={})
+
     def export_project(self, project_id: str) -> str:
         response = self._session().get(
             self._url(f"/projects/{project_id}/export"),

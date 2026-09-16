@@ -304,14 +304,21 @@ def run_reason_task(
                 )
                 intervention_count += 1  # handled: recognized and deliberately skipped
                 continue
-            response = client.create_auth_request(
-                project_id=project.project.id,
-                source_fact_ids=intervention["from"],
-                auth_ref=auth_ref,
-                role=role,
-                login_url=intervention.get("login_url"),
-                reason=intervention["reason"],
-            )
+            if config.auth_control_plane_mode != "legacy":
+                response = client.create_auth_request_internal(
+                    project_id=project.project.id,
+                    source_fact_ids=intervention["from"],
+                    auth_ref=auth_ref,
+                )
+            else:
+                response = client.create_auth_request(
+                    project_id=project.project.id,
+                    source_fact_ids=intervention["from"],
+                    auth_ref=auth_ref,
+                    role=role,
+                    login_url=None,
+                    reason=intervention["reason"],
+                )
             if response.status_code == 409:
                 # Dedup hit (valid session or in-flight request already exists): not an error.
                 LOG.info(
