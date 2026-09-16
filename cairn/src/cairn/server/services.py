@@ -799,6 +799,36 @@ def recover_auth_event_claims(
             )
             if cursor.rowcount:
                 _append_auth_lifecycle(conn, row["request_id"], row["id"], "retry_exhausted", "retry_exhausted", recorded_at=now)
+                if row["kind"] == "login_succeeded":
+                    verifying = conn.execute(
+                        """
+                        SELECT event_id FROM auth_lifecycle_events
+                        WHERE request_id = ? AND kind = 'verifying'
+                        ORDER BY sequence DESC
+                        LIMIT 1
+                        """,
+                        (row["request_id"],),
+                    ).fetchone()
+                    if verifying is not None and verifying["event_id"] == row["id"]:
+                        conn.execute(
+                            """
+                            UPDATE auth_requests
+                               SET status = 'failed', completed_at = ?,
+                                   failure_reason = 'verification_failed',
+                                   claimed_by = NULL, claimed_at = NULL,
+                                   helper_actor_id = NULL
+                             WHERE id = ? AND status = 'verifying'
+                            """,
+                            (now, row["request_id"]),
+                        )
+                        _append_auth_lifecycle(
+                            conn,
+                            row["request_id"],
+                            row["id"],
+                            "failed",
+                            "verification_failed",
+                            recorded_at=now,
+                        )
                 changed += cursor.rowcount
             continue
         delay = 2 ** max(0, attempts - 1)

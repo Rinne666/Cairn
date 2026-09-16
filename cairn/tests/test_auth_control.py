@@ -159,6 +159,61 @@ def test_login_succeeded_can_resume_verification_on_the_same_claimed_event(clien
     assert second.json()["state"] == "claimed"
 
 
+def test_exhausted_verification_claim_fails_request_even_when_ttl_disabled(client: TestClient) -> None:
+    with db.get_conn() as conn:
+        conn.execute("UPDATE settings SET auth_request_ttl = 0 WHERE rowid = 1")
+        conn.execute(
+            "UPDATE auth_requests SET status = 'verifying', helper_actor_id = 'helper-a' WHERE id = 'r1'"
+        )
+        conn.execute(
+            "INSERT INTO auth_events "
+            "(id, project_id, request_id, auth_ref, kind, actor_id, idempotency_key, "
+            "occurred_at, received_at, state, attempt_count, claim_expires_at, claimed_by) VALUES "
+            "('e-login-recovery', 'p1', 'r1', 'target', 'login_succeeded', 'helper-a', ?, ?, ?, 'claimed', 3, ?, 'd1')",
+            (str(uuid4()), _ts(), _ts(), _ts(60)),
+        )
+        conn.execute(
+            "INSERT INTO auth_lifecycle_events "
+            "(request_id, event_id, sequence, kind, recorded_at, outcome_code) "
+            "VALUES ('r1', 'e-login-recovery', 1, 'verifying', ?, 'verifying')",
+            (_ts(),),
+        )
+
+    recovered = client.post("/internal/auth/events/recover", json={}, headers=_headers())
+    assert recovered.status_code == 200
+    assert recovered.json() == {"recovered": 1}
+
+    with db.get_conn() as conn:
+        event = conn.execute(
+            "SELECT state, outcome_code, claimed_by, claim_expires_at FROM auth_events WHERE id = 'e-login-recovery'"
+        ).fetchone()
+        request = conn.execute(
+            "SELECT status, failure_reason, helper_actor_id, claimed_by, completed_at, expires_at "
+            "FROM auth_requests WHERE id = 'r1'"
+        ).fetchone()
+        lifecycle = conn.execute(
+            "SELECT kind, outcome_code FROM auth_lifecycle_events WHERE request_id = 'r1' ORDER BY sequence"
+        ).fetchall()
+
+    assert dict(event) == {
+        "state": "rejected",
+        "outcome_code": "retry_exhausted",
+        "claimed_by": None,
+        "claim_expires_at": None,
+    }
+    assert request["status"] == "failed"
+    assert request["failure_reason"] == "verification_failed"
+    assert request["helper_actor_id"] is None
+    assert request["claimed_by"] is None
+    assert request["completed_at"] is not None
+    assert request["expires_at"] is None
+    assert [(row["kind"], row["outcome_code"]) for row in lifecycle] == [
+        ("verifying", "verifying"),
+        ("retry_exhausted", "retry_exhausted"),
+        ("failed", "verification_failed"),
+    ]
+
+
 def test_login_succeeded_second_event_is_terminally_rejected(client: TestClient) -> None:
     with db.get_conn() as conn:
         conn.execute("UPDATE auth_events SET state = 'rejected' WHERE id = 'e1'")
